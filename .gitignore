@@ -1,0 +1,51 @@
+# SwiftPM 残留（已迁移 Xcode，防意外生成）
+.build/
+.swiftpm/
+.claude/
+.verify/
+
+# Xcode
+DerivedData/
+xcuserdata/
+*.moved-aside
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+*.xccheckout
+*.xcscmblueprint
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM/
+
+# 归档/打包产物
+*.app/
+*.dmg
+*.pkg
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+
+# VSCode（当前 settings.json 为空，不入库；如需共享配置再放开）
+.vscode/
+
+# 编辑器备份
+*~
+*.swp
+*.swo
+*.orig
+
+# 环境与密钥（按需）
+.env
+.env.*
+*.pem
+*.key
