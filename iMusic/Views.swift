@@ -691,7 +691,6 @@ struct SongRow: View {
             if let url = await player.resolveUrlOnly(song) { downloads.enqueue(song, urlString: url) }
           }
         }
-        Button(library.disliked.contains(song.id) ? "取消不喜欢" : "不喜欢") { library.toggleDislike(song) }
       } label: {
         Image(systemName: "ellipsis")
           .frame(width: 24, height: 24)
@@ -727,12 +726,62 @@ struct SongRow: View {
           if let url = await player.resolveUrlOnly(song) { downloads.enqueue(song, urlString: url) }
         }
       }
-      Button(library.disliked.contains(song.id) ? "取消不喜欢" : "不喜欢") { library.toggleDislike(song) }
     }
   }
 
   private var isLiked: Bool {
     library.playlists.first(where: { $0.id == "fav" })?.songs.contains(where: { $0.id == song.id }) ?? false
+  }
+}
+
+// MARK: - 播放全部按钮（歌单 / 最近播放共用）
+struct PlayAllButton: View {
+  var count: Int
+  var action: () -> Void
+  @State private var isHovered = false
+
+  private var isEnabled: Bool { count > 0 }
+  private var helpText: String {
+    isEnabled ? "按列表顺序播放这 \(count) 首歌曲" : "列表为空"
+  }
+
+  var body: some View {
+    Button(action: action) {
+      Label("播放全部", systemImage: "play.fill")
+        .font(Theme.body(.semibold))
+        .frame(minWidth: 92, minHeight: 40)
+    }
+    .buttonStyle(PlayAllButtonStyle(hovered: isHovered))
+    .disabled(!isEnabled)
+    .onHover { isHovered = $0 && isEnabled }
+    .help(helpText)
+    .accessibilityLabel("播放全部")
+    .accessibilityHint(helpText)
+  }
+}
+
+private struct PlayAllButtonStyle: ButtonStyle {
+  var hovered: Bool
+  @Environment(\.isEnabled) private var isEnabled
+
+  func makeBody(configuration: Configuration) -> some View {
+    let fill: Color
+    if !isEnabled {
+      fill = Theme.cardHover
+    } else if configuration.isPressed {
+      fill = Theme.accent.opacity(0.82)
+    } else {
+      fill = hovered ? Theme.accentHover : Theme.accent
+    }
+
+    return configuration.label
+      .foregroundStyle(isEnabled ? Theme.sidebar : Theme.text2)
+      .background(
+        RoundedRectangle(cornerRadius: Theme.radiusRow, style: .continuous)
+          .fill(fill)
+      )
+      .opacity(isEnabled ? 1 : 0.72)
+      .scaleEffect(configuration.isPressed ? 0.98 : 1)
   }
 }
 
@@ -1057,6 +1106,8 @@ struct PlaylistView: View {
 
           Spacer()
 
+          PlayAllButton(count: pl.songs.count, action: playAll)
+
           if playlistId != "fav" {
             VStack(spacing: 8) {
               Button("重命名") { renaming = true }
@@ -1124,6 +1175,12 @@ struct PlaylistView: View {
       .background(Theme.bg)
     }
   }
+
+  private func playAll() {
+    guard let songs = library.playlists.first(where: { $0.id == playlistId })?.songs,
+          let first = songs.first else { return }
+    player.play(first, in: songs)
+  }
 }
 
 struct HistoryView: View {
@@ -1138,6 +1195,7 @@ struct HistoryView: View {
           .foregroundStyle(.white)
         Spacer()
         if !library.history.isEmpty {
+          PlayAllButton(count: library.history.count, action: playAll)
           Button("清空历史", role: .destructive) { library.history.removeAll() }
             .controlSize(.small)
         }
@@ -1177,6 +1235,11 @@ struct HistoryView: View {
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity)
     .background(Theme.bg)
+  }
+
+  private func playAll() {
+    guard let first = library.history.first else { return }
+    player.play(first, in: library.history)
   }
 }
 
