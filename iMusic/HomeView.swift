@@ -16,10 +16,6 @@ struct HomeView: View {
     return HomeBoards.board(id: saved) != nil ? saved : HomeBoards.defaultBoardId
   }()
   @State private var sourceMenuHovered = false
-  @State private var randomSource: RandomListenSource = {
-    let saved = UserDefaults.standard.string(forKey: "home.randomSource") ?? ""
-    return RandomListenSource(rawValue: saved) ?? .all
-  }()
 
   // MARK: - 派生数据
 
@@ -111,9 +107,6 @@ struct HomeView: View {
     }
     .onChange(of: boardTab) { _, new in
       UserDefaults.standard.set(new, forKey: "home.boardId")
-    }
-    .onChange(of: randomSource) { _, new in
-      UserDefaults.standard.set(new.rawValue, forKey: "home.randomSource")
     }
   }
 
@@ -208,7 +201,7 @@ struct HomeView: View {
   // MARK: 随心听
 
   private var randomListen: some View {
-    RandomListenModule(source: $randomSource) { sel = $0 }
+    RandomListenModule()
   }
 }
 
@@ -533,7 +526,6 @@ private struct BoardChartRow: View {
             if let url = await player.resolveUrlOnly(song) { downloads.enqueue(song, urlString: url) }
           }
         }
-        Button(library.disliked.contains(song.id) ? "取消不喜欢" : "不喜欢") { library.toggleDislike(song) }
       } label: {
         Image(systemName: "ellipsis")
           .frame(width: 24, height: 24)
@@ -564,45 +556,20 @@ private struct BoardChartRow: View {
           if let url = await player.resolveUrlOnly(song) { downloads.enqueue(song, urlString: url) }
         }
       }
-      Button(library.disliked.contains(song.id) ? "取消不喜欢" : "不喜欢") { library.toggleDislike(song) }
     }
   }
 }
 
 // MARK: - 主页小组件
 
-private enum RandomListenSource: String, CaseIterable, Identifiable {
-  case all
-  case favorites
-  case history
-
-  var id: String { rawValue }
-
-  var title: String {
-    switch self {
-    case .all: return "全部"
-    case .favorites: return "收藏"
-    case .history: return "历史"
-    }
-  }
-
-  var accessibilityTitle: String {
-    switch self {
-    case .all: return "全部来源"
-    case .favorites: return "我的收藏"
-    case .history: return "最近播放"
-    }
-  }
-
-  var contextID: String { "random-listen.\(rawValue)" }
-}
+/// 随心听队列上下文；收藏/历史不再单独成队列（侧栏已有入口），只保留混合候选池。
+/// 后缀沿用 "all"，让旧版本已在播放的随机队列不被判为失效。
+private let randomListenContextID = "random-listen.all"
 
 private struct RandomListenModule: View {
   @Environment(SearchService.self) private var search
   @Environment(PlayerStore.self) private var player
   @Environment(LibraryStore.self) private var library
-  @Binding var source: RandomListenSource
-  let navigate: (SideItem) -> Void
   @State private var isPrimaryHovered = false
   @FocusState private var isPrimaryFocused: Bool
 
@@ -610,261 +577,155 @@ private struct RandomListenModule: View {
     library.playlists.first(where: { $0.id == "fav" })?.songs ?? []
   }
 
-  private var favoriteSongs: [MusicInfo] {
-    uniqueSongs(rawFavoriteSongs)
-  }
-
-  private var historySongs: [MusicInfo] {
-    uniqueSongs(library.history)
-  }
-
   private var pool: [MusicInfo] {
     uniqueSongs(search.hot + library.history + rawFavoriteSongs)
   }
 
-  private var sourceSongs: [MusicInfo] {
-    switch source {
-    case .all: return pool
-    case .favorites: return favoriteSongs
-    case .history: return historySongs
-    }
-  }
-
   private var hasActiveQueue: Bool {
-    player.queueContext == source.contextID && !player.queue.isEmpty
-  }
-  private var isPrimaryLoading: Bool {
-    hasActiveQueue && player.playbackState == .loading
-  }
-  private var isPrimaryDisabled: Bool {
-    (sourceSongs.isEmpty && !hasActiveQueue) || isPrimaryLoading
+    player.queueContext == randomListenContextID && !player.queue.isEmpty
   }
 
-  private var summaryTitle: String {
-    switch source {
-    case .all: return "随机播放"
-    case .favorites: return "从收藏里随机"
-    case .history: return "从最近播放里随机"
-    }
+  /// 候选为空且热榜失败：主按钮就地转为重试，不再另开次级按钮
+  private var canRetryLoad: Bool {
+    !hasActiveQueue && pool.isEmpty && search.error != nil && !search.hotLoading
   }
 
-  private var summaryDescription: String {
-    guard !sourceSongs.isEmpty else {
-      switch source {
-      case .all: return "正在等待真实歌曲进入候选"
-      case .favorites: return "收藏后会从这里随机播放"
-      case .history: return "播放过的歌曲会进入候选"
+  private var currentName: String { player.current?.name ?? "" }
+
+  private var positionSuffix: String {
+    player.current.flatMap { current in
+      player.queue.firstIndex(where: { $0.id == current.id })
+        .map { " · \($0 + 1)/\(player.queue.count)" }
+    } ?? ""
+  }
+
+  /// 模块的全部状态。图标 + 文案 + 主按钮三处共用它，避免三套并行判断。
+  private enum Phase {
+    case ready, poolLoading, poolEmpty, loadFailed, loading, playing, paused, finished, failed
+
+    var symbol: String {
+      switch self {
+      case .ready: return "shuffle"
+      case .poolLoading, .loading: return "hourglass"
+      case .poolEmpty: return "music.note.list"
+      case .loadFailed, .failed: return "exclamationmark.triangle.fill"
+      case .playing: return "waveform"
+      case .paused: return "pause.circle"
+      case .finished: return "checkmark.circle"
       }
     }
-    if sourceSongs.count <= 20 {
-      return "将随机排列 \(sourceSongs.count) 首\(source == .all ? "真实歌曲" : "歌曲")"
-    }
-    return "从 \(sourceSongs.count) 首歌曲中随机挑选 20 首"
+
+    var isFailure: Bool { self == .loadFailed || self == .failed }
   }
 
-  private var excludedCount: Int {
-    let songs: [MusicInfo]
-    switch source {
-    case .all: songs = search.hot + library.history + rawFavoriteSongs
-    case .favorites: songs = rawFavoriteSongs
-    case .history: songs = library.history
+  private var phase: Phase {
+    if hasActiveQueue {
+      switch player.playbackState {
+      case .idle, .loading: return .loading
+      case .failed: return .failed
+      case .ready: return player.status == "播放结束" ? .finished : (player.isPlaying ? .playing : .paused)
+      }
     }
-    return Set(songs.filter { library.disliked.contains($0.id) }.map(\.id)).count
+    guard !pool.isEmpty else {
+      if search.hotLoading { return .poolLoading }
+      return search.error != nil ? .loadFailed : .poolEmpty
+    }
+    return .ready
+  }
+
+  private var isPrimaryDisabled: Bool {
+    if canRetryLoad { return false }
+    return phase == .poolEmpty || phase == .poolLoading || phase == .loading
+  }
+
+  private var statusText: String {
+    switch phase {
+    case .ready:
+      return "从 \(pool.count) 首候选中随机挑选 \(min(20, pool.count)) 首"
+    case .poolLoading: return "正在准备热榜"
+    case .poolEmpty: return "搜索或收藏过的歌曲会进入候选"
+    case .loadFailed: return search.error ?? "热榜加载失败"
+    case .loading: return "正在准备「\(currentName)」"
+    case .playing: return "正在播放「\(currentName)」\(positionSuffix)"
+    case .paused: return "已暂停「\(currentName)」"
+    case .finished: return "队列已播完"
+    case .failed: return player.status
+    }
   }
 
   private var primaryTitle: String {
-    if hasActiveQueue {
-      if isPrimaryLoading { return "正在准备" }
-      if player.isPlaying { return "暂停" }
-      if player.playbackState == .failed { return "重试播放" }
-      return "继续播放"
-    }
-    switch source {
-    case .all: return "开始随机播放"
-    case .favorites: return "随机播放收藏"
-    case .history: return "随机播放历史"
+    switch phase {
+    case .ready, .poolEmpty, .poolLoading: return "随机播放"
+    case .loadFailed: return "重试热榜"
+    case .loading: return "正在准备"
+    case .playing: return "暂停"
+    case .paused: return "继续播放"
+    case .finished: return "再听一遍"
+    case .failed: return "重试播放"
     }
   }
 
   private var primarySymbol: String {
-    if hasActiveQueue {
-      if isPrimaryLoading { return "hourglass" }
-      if player.isPlaying { return "pause.fill" }
-      if player.playbackState == .failed { return "arrow.clockwise" }
-      return "play.fill"
+    switch phase {
+    case .ready: return "shuffle"
+    case .loadFailed, .finished, .failed: return "arrow.clockwise"
+    case .playing: return "pause.fill"
+    default: return "play.fill"
     }
-    return "play.fill"
   }
 
   private var primaryHelp: String {
-    if hasActiveQueue {
-      if player.isPlaying { return "暂停当前随机队列" }
-      if player.playbackState == .failed { return "重试播放当前歌曲" }
-      return "继续播放当前随机队列"
-    }
-    return "随机排列\(source.accessibilityTitle)后开始播放"
-  }
-
-  private var readyStatusText: String {
-    let count = excludedCount
-    return count > 0
-      ? "已排除 \(count) 首标记为不喜欢的歌曲"
-      : "随机结果只包含当前来源中未标记不喜欢的歌曲"
-  }
-
-  private var activeStatusTitle: String {
-    guard let name = player.current?.name else { return "随机队列已准备" }
-    switch player.playbackState {
-    case .idle:
-      return "随机队列已准备"
-    case .loading:
-      return "正在准备「\(name)」"
-    case .ready:
-      if player.status == "播放结束" { return "随机队列已播放完" }
-      return player.isPlaying ? "正在播放「\(name)」" : "已暂停「\(name)」"
-    case .failed:
-      return "暂时无法播放"
-    }
-  }
-
-  private var activeStatusDetail: String {
-    switch player.playbackState {
-    case .idle:
-      return "准备完成后会自动开始播放"
-    case .loading:
-      return "音源解析完成后会自动开始播放"
-    case .ready:
-      if player.status == "播放结束" { return "继续播放会从最后一首重新开始" }
-      if player.isPlaying { return activeQueueDetail }
-      return "继续后会从当前歌曲播放"
-    case .failed:
-      return "\(player.status)。请检查音源设置后重试"
-    }
-  }
-
-  private var activeQueueDetail: String {
-    let position = player.current.flatMap { current in
-      player.queue.firstIndex(where: { $0.id == current.id }).map { "\($0 + 1) / \(player.queue.count)" }
-    }
-    let singer = player.current?.singer.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-    return [position, singer.nilIfEmpty].compactMap { $0 }.joined(separator: " · ")
-  }
-
-  private var emptyStatusTitle: String {
-    if source == .all, search.hotLoading, pool.isEmpty { return "正在准备热榜" }
-    if source == .all, search.error != nil, pool.isEmpty { return "热榜暂时无法加载" }
-    switch source {
-    case .all: return "还没有可随机歌曲"
-    case .favorites: return "收藏里还没有歌曲"
-    case .history: return "最近播放还没有歌曲"
-    }
-  }
-
-  private var emptyStatusDetail: String {
-    if source == .all, search.hotLoading, pool.isEmpty {
-      return "收藏和最近播放仍会同时加入候选"
-    }
-    if source == .all, let error = search.error, pool.isEmpty {
-      return "\(error)。请重试，或先搜索想听的音乐"
-    }
-    switch source {
-    case .all: return "搜索并收藏歌曲后，即可从这里开始播放"
-    case .favorites: return "搜索并收藏歌曲后，就能从这里随机播放"
-    case .history: return "播放过的歌曲会出现在这里，也会进入全部随机"
+    switch phase {
+    case .ready: return "从 \(pool.count) 首候选中随机排列 \(min(20, pool.count)) 首后开始播放"
+    case .loadFailed: return "重新加载热榜"
+    case .poolEmpty, .poolLoading: return "候选为空，搜索或收藏歌曲后即可随机播放"
+    case .loading: return "音源解析完成后会自动开始播放"
+    case .playing: return "暂停当前随机队列"
+    case .paused: return "继续播放当前随机队列"
+    case .finished: return "从头再听一遍随机队列"
+    case .failed: return "重试播放「\(currentName)」"
     }
   }
 
   var body: some View {
-    VStack(alignment: .leading, spacing: 16) {
-      header
-      mainContent
-      Divider()
-        .overlay(Theme.separator)
-      statusView
+    HStack(alignment: .center, spacing: 16) {
+      statusBlock
+      Spacer(minLength: 12)
+      primaryButton
     }
-    .padding(16)
+    .padding(.horizontal, 16)
+    .padding(.vertical, 14)
     .background(
       RoundedRectangle(cornerRadius: Theme.radiusCard, style: .continuous)
         .fill(Theme.card)
     )
     .accessibilityElement(children: .contain)
     .accessibilityLabel("随心听")
-    .accessibilityValue("\(source.accessibilityTitle)，\(summaryDescription)")
   }
 
-  private var header: some View {
-    ViewThatFits(in: .horizontal) {
-      HStack(alignment: .center, spacing: 16) {
-        titleBlock
-        Spacer(minLength: 16)
-        sourcePicker
-          .frame(width: 260)
-      }
-      VStack(alignment: .leading, spacing: 12) {
-        titleBlock
-        sourcePicker
-          .frame(maxWidth: 280)
-      }
-    }
-  }
-
-  private var titleBlock: some View {
-    VStack(alignment: .leading, spacing: 3) {
+  private var statusBlock: some View {
+    VStack(alignment: .leading, spacing: 4) {
       Text("随心听")
         .font(Theme.title())
         .foregroundStyle(Theme.text)
-      Text("把下一首交给音乐")
-        .font(Theme.bodySM())
-        .foregroundStyle(Theme.text2)
-    }
-  }
-
-  private var sourcePicker: some View {
-    Picker("随机听来源", selection: $source) {
-      ForEach(RandomListenSource.allCases) { item in
-        Text(item.title)
-          .tag(item)
-      }
-    }
-    .pickerStyle(.segmented)
-    .labelsHidden()
-    .tint(Theme.accent)
-    .accessibilityLabel("随机听来源")
-  }
-
-  private var mainContent: some View {
-    HStack(spacing: 14) {
-      RoundedRectangle(cornerRadius: Theme.radiusCover, style: .continuous)
-        .fill(Theme.field)
-        .frame(width: 64, height: 64)
-        .overlay {
-          Image(systemName: "shuffle")
-            .font(.system(size: 24, weight: .semibold))
-            .foregroundStyle(Theme.accent)
-        }
-        .accessibilityHidden(true)
-
-      VStack(alignment: .leading, spacing: 5) {
-        Text(summaryTitle)
-          .font(Theme.titleLG())
-          .foregroundStyle(Theme.text)
-          .lineLimit(2)
-        Text(summaryDescription)
+      HStack(spacing: 5) {
+        Image(systemName: phase.symbol)
+          .font(.system(size: 11, weight: .medium))
+          .foregroundStyle(phase.isFailure ? Theme.danger : Theme.text2)
+          .accessibilityHidden(true)
+        Text(statusText)
           .font(Theme.bodySM())
-          .foregroundStyle(Theme.text2)
+          .foregroundStyle(phase.isFailure ? Theme.danger : Theme.text2)
           .lineLimit(2)
           .fixedSize(horizontal: false, vertical: true)
       }
-      .frame(maxWidth: .infinity, alignment: .leading)
-
-      primaryButton
     }
   }
 
   private var primaryButton: some View {
     Button(action: performPrimaryAction) {
       HStack(spacing: 8) {
-        if isPrimaryLoading {
+        if phase == .loading {
           ProgressView()
             .controlSize(.small)
             .tint(Theme.sidebar)
@@ -894,114 +755,24 @@ private struct RandomListenModule: View {
     .accessibilityHint(primaryHelp)
   }
 
-  @ViewBuilder private var statusView: some View {
-    if hasActiveQueue {
-      HStack(alignment: .top, spacing: 10) {
-        activeStatusIcon
-          .frame(width: 20, height: 20)
-        VStack(alignment: .leading, spacing: 2) {
-          Text(activeStatusTitle)
-            .font(Theme.body(.semibold))
-            .foregroundStyle(player.playbackState == .failed ? Theme.danger : Theme.text)
-          Text(activeStatusDetail)
-            .font(Theme.bodySM())
-            .foregroundStyle(Theme.text2)
-            .lineLimit(2)
-        }
-        Spacer(minLength: 12)
-        if player.playbackState == .failed {
-          Button("检查音源") { navigate(.source) }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-        }
-      }
-    } else if sourceSongs.isEmpty {
-      HStack(alignment: .top, spacing: 10) {
-        emptyStatusIcon
-          .frame(width: 20, height: 20)
-        VStack(alignment: .leading, spacing: 2) {
-          Text(emptyStatusTitle)
-            .font(Theme.body(.semibold))
-            .foregroundStyle(Theme.text)
-          Text(emptyStatusDetail)
-            .font(Theme.bodySM())
-            .foregroundStyle(Theme.text2)
-            .lineLimit(2)
-        }
-        Spacer(minLength: 12)
-        emptyAction
-      }
-    } else {
-      HStack(spacing: 8) {
-        Image(systemName: "checkmark.circle.fill")
-          .foregroundStyle(Theme.accent)
-          .accessibilityHidden(true)
-        Text(readyStatusText)
-          .font(Theme.bodySM())
-          .foregroundStyle(Theme.text2)
-        Spacer(minLength: 0)
-      }
-    }
-  }
-
-  @ViewBuilder private var activeStatusIcon: some View {
-    if player.playbackState == .loading {
-      ProgressView()
-        .controlSize(.small)
-    } else {
-      Image(systemName: player.playbackState == .failed
-        ? "exclamationmark.triangle.fill"
-        : (player.isPlaying ? "waveform" : "pause.circle"))
-        .foregroundStyle(player.playbackState == .failed ? Theme.danger : Theme.accent)
-        .accessibilityHidden(true)
-    }
-  }
-
-  @ViewBuilder private var emptyStatusIcon: some View {
-    if source == .all, search.hotLoading, pool.isEmpty {
-      ProgressView()
-        .controlSize(.small)
-    } else {
-      Image(systemName: "music.note.list")
-        .foregroundStyle(Theme.text2)
-        .accessibilityHidden(true)
-    }
-  }
-
-  @ViewBuilder private var emptyAction: some View {
-    if source != .all, !pool.isEmpty {
-      Button("试试全部") { source = .all }
-        .buttonStyle(.bordered)
-        .controlSize(.small)
-    } else if source == .all, search.error != nil, !search.hotLoading, pool.isEmpty {
-      Button("重新加载热榜") {
-        Task { await search.loadHot() }
-      }
-      .buttonStyle(.bordered)
-      .controlSize(.small)
-    } else if !(source == .all && search.hotLoading && pool.isEmpty) {
-      Button("搜索音乐") { navigate(.search) }
-        .buttonStyle(.bordered)
-        .controlSize(.small)
-    }
-  }
-
   private func uniqueSongs(_ songs: [MusicInfo]) -> [MusicInfo] {
     var seen = Set<String>()
-    return songs.filter {
-      !library.disliked.contains($0.id) && seen.insert($0.id).inserted
-    }
+    return songs.filter { seen.insert($0.id).inserted }
   }
 
   private func performPrimaryAction() {
+    if canRetryLoad {
+      Task { await search.loadHot() }
+      return
+    }
     if hasActiveQueue {
       player.toggle()
       return
     }
-    let queue = Array(sourceSongs.shuffled().prefix(20))
+    let queue = Array(pool.shuffled().prefix(20))
     guard let first = queue.first else { return }
     player.mode = .sequence
-    player.play(first, in: queue, context: source.contextID)
+    player.play(first, in: queue, context: randomListenContextID)
   }
 }
 
@@ -1029,11 +800,6 @@ private struct RandomListenButtonStyle: ButtonStyle {
       .scaleEffect(configuration.isPressed ? 0.98 : 1)
   }
 }
-
-private extension String {
-  var nilIfEmpty: String? { isEmpty ? nil : self }
-}
-
 
 private struct HomeBoardCard: View {
   @Environment(PlayerStore.self) private var player

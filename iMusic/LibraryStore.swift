@@ -2,8 +2,8 @@ import Foundation
 import SwiftUI
 import Observation
 
-// MARK: - 资料库（对标 renderer/store/list + dislikeList）
-// 歌单 CRUD + 不喜欢名单 + 播放历史，JSON 落盘 Application Support/iMusic/
+// MARK: - 资料库（对标 renderer/store/list）
+// 歌单 CRUD + 播放历史，JSON 落盘 Application Support/iMusic/
 
 struct Playlist: Codable, Identifiable, Hashable, Sendable {
   var id: String
@@ -15,7 +15,6 @@ struct Playlist: Codable, Identifiable, Hashable, Sendable {
 final class LibraryStore {
   static let shared = LibraryStore()
   var playlists: [Playlist] = []
-  var disliked: Set<String> = [] // MusicInfo.id 集合（对标 dislikeList）
   var history: [MusicInfo] = [] // 最近播放（最多100）
 
   private let fm = FileManager.default
@@ -27,7 +26,7 @@ final class LibraryStore {
 
   init() { load() }
 
-  private struct Root: Codable { var playlists: [Playlist]; var disliked: [String]; var history: [MusicInfo] }
+  private struct Root: Codable { var playlists: [Playlist]; var history: [MusicInfo] }
   private var file: URL { dir.appendingPathComponent("library.json") }
 
   func load() {
@@ -37,12 +36,11 @@ final class LibraryStore {
       return
     }
     playlists = r.playlists.isEmpty ? [Playlist(id: "fav", name: "我喜欢", songs: [])] : r.playlists
-    disliked = Set(r.disliked)
     history = r.history
   }
 
   private func save() {
-    let r = Root(playlists: playlists, disliked: Array(disliked), history: Array(history.prefix(100)))
+    let r = Root(playlists: playlists, history: Array(history.prefix(100)))
     if let d = try? JSONEncoder().encode(r) { try? d.write(to: file) }
   }
 
@@ -70,11 +68,7 @@ final class LibraryStore {
     playlists[i].songs.removeAll { $0.id == song.id }; save()
   }
 
-  // MARK: dislike / history
-  func toggleDislike(_ song: MusicInfo) {
-    if disliked.contains(song.id) { disliked.remove(song.id) } else { disliked.insert(song.id) }
-    save()
-  }
+  // MARK: history
   func pushHistory(_ song: MusicInfo) {
     history.removeAll { $0.id == song.id }
     history.insert(song, at: 0)
