@@ -37,6 +37,52 @@ private enum SpotifyScrollbarController {
   }
 }
 
+// MARK: - 按 token 变化把宿主 NSScrollView 立即滚回顶部
+
+@MainActor
+private struct ScrollToTopInstaller: NSViewRepresentable {
+  /// 值变化即回顶；重复滚到顶部是幂等的，所以发起/结束各触发一次也无副作用
+  var token: Int
+
+  func makeNSView(context: Context) -> InstallerView {
+    let view = InstallerView()
+    view.appliedToken = token
+    return view
+  }
+
+  func updateNSView(_ nsView: InstallerView, context: Context) {
+    nsView.apply(token: token)
+  }
+
+  final class InstallerView: NSView {
+    var appliedToken = 0
+
+    func apply(token: Int) {
+      guard token != appliedToken else { return }
+      // 还没挂到 NSScrollView（视图层级未搭完）时不消费 token，下帧再试
+      if scrollToEnd() {
+        appliedToken = token
+      } else {
+        DispatchQueue.main.async { [weak self] in
+          guard let self, self.scrollToEnd() else { return }
+          self.appliedToken = token
+        }
+      }
+    }
+
+    @discardableResult
+    private func scrollToEnd() -> Bool {
+      guard let scrollView = enclosingScrollView, let doc = scrollView.documentView else { return false }
+      let clip = scrollView.contentView
+      // 顶部在文档坐标系里的原点：flipped 文档 minY 起算，非 flipped 要减去视口高度
+      let top = doc.isFlipped ? doc.bounds.minY : doc.bounds.maxY - clip.bounds.height
+      clip.scroll(to: NSPoint(x: clip.bounds.minX, y: top))
+      scrollView.reflectScrolledClipView(clip)
+      return true
+    }
+  }
+}
+
 @MainActor
 private struct SpotifyScrollbarInstaller: NSViewRepresentable {
   func makeNSView(context: Context) -> InstallerView {
@@ -89,5 +135,10 @@ extension View {
   /// 给纵向 ScrollView 换上 Spotify 配色的原生滑块
   func spotifyScrollbar() -> some View {
     background(SpotifyScrollbarInstaller())
+  }
+
+  /// token 变化时把所在 ScrollView 立即滚回顶部（挂在滚动内容上，需能向上找到 NSScrollView）
+  func scrollToTop(token: Int) -> some View {
+    background(ScrollToTopInstaller(token: token))
   }
 }

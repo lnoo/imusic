@@ -2,6 +2,7 @@ import Foundation
 import AVFoundation
 import SwiftUI
 import Observation
+import CoreAudio
 
 // MARK: - PlayerStore
 // 对标 src/renderer/core/music/online.ts#getMusicUrl + utils.ts#handleGetOnlineMusicUrl
@@ -112,6 +113,7 @@ final class PlayerStore {
 
   init() {
     configurePlayer()
+    OutputRouteMonitor.shared.start { [weak self] in self?.outputRouteChanged() }
     NotificationCenter.default.addObserver(forName: AVPlayerItem.didPlayToEndTimeNotification, object: nil, queue: .main) { [weak self] notification in
       guard let item = notification.object as? AVPlayerItem else { return }
       let itemID = ObjectIdentifier(item)
@@ -382,6 +384,15 @@ final class PlayerStore {
     Task { await resolveAndPlay(song, token: token) }
   }
 
+  /// 默认输出设备断连/切走 → 暂停（已确认策略：不自动恢复，恢复须用户手动操作）
+  private func outputRouteChanged() {
+    guard isPlaying else { return }
+    let deviceRemoved = !OutputRouteMonitor.deviceStillConnected(OutputRouteMonitor.previousDeviceID)
+    player.pause()
+    isPlaying = false
+    status = deviceRemoved ? "输出设备已断开，已暂停" : "输出设备已切换，已暂停"
+  }
+
   func togglePlay(_ on: Bool) {
     if on {
       guard canTogglePlayback else { return }
@@ -627,6 +638,78 @@ final class PlayerStore {
         if gotLyric && gotPic { break }
       }
     }
+  }
+}
+
+// MARK: - OutputRouteMonitor
+// 默认输出设备监听：设备断连或系统把默认输出切走（AirPods 摆下入盒、拔线、手动切源）时回调。
+// macOS 无公开的"摘下耳机"事件（iOS 的 AVAudioSession route 通知不可用），
+// 因此能覆盖的是设备断连/默认输出变化；摘下耳机但未断连（放桌上）收不到事件，属已知限制。
+// 已确认策略：断连/切走 → 暂停，不自动恢复。
+@MainActor
+final class OutputRouteMonitor {
+  static let shared = OutputRouteMonitor()
+  /// 上一次的默认输出设备 ID（变化回调里取，用于区分"断开"与"切到另一设备"）
+  private(set) static var previousDeviceID = AudioDeviceID(kAudioObjectUnknown)
+
+  private var listenerBlock: AudioObjectPropertyListenerBlock?
+  private var activeDeviceID = AudioDeviceID(kAudioObjectUnknown)
+  private var onChange: (() -> Void)?
+
+  private static var defaultOutputDeviceID: AudioDeviceID {
+    var address = AudioObjectPropertyAddress(
+      mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+      mScope: kAudioObjectPropertyScopeGlobal,
+      mElement: kAudioObjectPropertyElementMain
+    )
+    var deviceID = AudioDeviceID(kAudioObjectUnknown)
+    var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+    let status = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &deviceID)
+    return status == noErr ? deviceID : AudioDeviceID(kAudioObjectUnknown)
+  }
+
+  /// 该设备是否仍存在于当前设备列表（用于区分断开 vs 切换）
+  static func deviceStillConnected(_ id: AudioDeviceID) -> Bool {
+    guard id != AudioDeviceID(kAudioObjectUnknown) else { return false }
+    var address = AudioObjectPropertyAddress(
+      mSelector: kAudioHardwarePropertyDevices,
+      mScope: kAudioObjectPropertyScopeGlobal,
+      mElement: kAudioObjectPropertyElementMain
+    )
+    var size: UInt32 = 0
+    guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size) == noErr,
+          size >= UInt32(MemoryLayout<AudioDeviceID>.size) else { return false }
+    let count = Int(size) / MemoryLayout<AudioDeviceID>.size
+    let buffer = UnsafeMutablePointer<AudioDeviceID>.allocate(capacity: count)
+    defer { buffer.deallocate() }
+    var readSize = size
+    guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &readSize, buffer) == noErr else { return false }
+    return (0..<count).contains { buffer[$0] == id }
+  }
+
+  /// 开始监听（幂等）；仅在默认输出设备 ID 真正变化时回调，于主队列执行
+  func start(_ onChange: @escaping () -> Void) {
+    guard listenerBlock == nil else { return }
+    self.onChange = onChange
+    activeDeviceID = Self.defaultOutputDeviceID
+    var address = AudioObjectPropertyAddress(
+      mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+      mScope: kAudioObjectPropertyScopeGlobal,
+      mElement: kAudioObjectPropertyElementMain
+    )
+    let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+      Task { @MainActor [weak self] in self?.routeChanged() }
+    }
+    listenerBlock = block
+    AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &address, .main, block)
+  }
+
+  private func routeChanged() {
+    let newID = Self.defaultOutputDeviceID
+    guard newID != activeDeviceID else { return }
+    Self.previousDeviceID = activeDeviceID
+    activeDeviceID = newID
+    onChange?()
   }
 }
 
