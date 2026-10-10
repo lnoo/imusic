@@ -126,7 +126,6 @@ struct ContentView: View {
             .font(.system(size: 13))
             .foregroundStyle(Theme.text2)
           TextField("搜索歌曲、歌手、专辑", text: $search.keyword)
-            .textFieldStyle(.plain)
             .frame(width: 220)
             .onSubmit {
               let kw = search.keyword
@@ -160,7 +159,7 @@ struct ContentView: View {
     switch sel {
     case .home: HomeView(sel: $sel)
     case .search: SearchView()
-    case .nowPlaying: NowPlayingView()
+    case .nowPlaying: NowPlayingView(sel: $sel)
     case .history: HistoryView()
     case .downloads: DownloadsView()
     case .source: SourceSettingsView()
@@ -869,6 +868,8 @@ struct SearchView: View {
   @Environment(DownloadStore.self) private var downloads
 
   var body: some View {
+    // 每轮搜索发起（session+1）与结束（searching 翻回 false）都会变 → 驱动列表滚回顶部
+    let scrollToken = search.searchSession * 2 + (search.searching ? 1 : 0)
     VStack(spacing: 0) {
       if search.results.isEmpty && !search.searching {
         EmptyStateView(
@@ -910,6 +911,8 @@ struct SearchView: View {
             .padding(.vertical, 6)
             .padding(.horizontal, 8)
             .spotifyScrollbar()
+            // 附件挂在滚动内容里才能拿到宿主 NSScrollView；token 变化即回顶
+            .scrollToTop(token: scrollToken)
           }
           .overlay {
             if search.searching {
@@ -929,6 +932,9 @@ struct SearchView: View {
 // MARK: - 正在播放
 struct NowPlayingView: View {
   @Environment(PlayerStore.self) private var player
+  @Environment(SearchService.self) private var search
+  @Binding var sel: SideItem
+  @State private var singerHovered = false
 
   var body: some View {
     HStack(spacing: 28) {
@@ -942,10 +948,21 @@ struct NowPlayingView: View {
             .foregroundStyle(.white)
             .lineLimit(2)
 
-          Text(player.current?.singer ?? "")
-            .font(.title3)
-            .foregroundStyle(Theme.text2)
-            .lineLimit(1)
+          // 点歌手 → 切到搜索页并搜该歌手（搜索框关键词同步更新）
+          if let singer = player.current?.singer, !singer.isEmpty {
+            Text(singer)
+              .font(.title3)
+              .foregroundStyle(singerHovered ? Theme.text : Theme.text2)
+              .underline(singerHovered)
+              .lineLimit(1)
+              .onHover { singerHovered = $0 }
+              .onTapGesture {
+                search.keyword = singer
+                sel = .search
+                Task { await search.searchAll(keyword: singer) }
+              }
+              .help("搜索该歌手")
+          }
 
           if let album = player.current?.albumName, !album.isEmpty {
             Text(album)

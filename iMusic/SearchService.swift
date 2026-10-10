@@ -14,6 +14,10 @@ final class SearchService {
   var error: String?
   var keyword = ""
 
+  /// 搜索会话号：每次发起新搜索 +1，供 UI 判断“新一轮结果已落地”并把列表滚回顶部；
+  /// 同时用于丢弃过期的并发结果（晚返回的旧请求不应覆盖新查询）。
+  var searchSession = 0
+
   /// 默认榜单（打开即有歌，不知道搜啥也能直接点）
   /// 对标 kw/leaderboard.js 的榜单概念，但榜单详情接口需 wbdCrypto 签名，
   /// MVP 用免签名的老接口 kbangserver（桌面端注释里保留的 getUrl 同源）。
@@ -46,14 +50,33 @@ final class SearchService {
   var enabledSources: Set<MusicSource> = Set(MusicSource.allCases.filter { $0 != .local })
 
   func search(keyword: String, page: Int = 1, limit: Int = 30) async {
+    guard let fn = SourceRegistry.searchable.first?.search else { return } // 注册表首个可搜索源（历史行为）
+    await search(fn, keyword: keyword, page: page, limit: limit)
+  }
+
+  /// 发起新一轮搜索的唯一入口：会话号 +1（供结果列表回顶、丢弃过期并发结果）
+  /// 然后写入 keyword 并置 searching。发起与结束各改变一次 scrollToken，见 SearchView。
+  private func start(keyword: String) -> Bool {
     let kw = keyword.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !kw.isEmpty else { return }
-    searching = true; error = nil
+    guard !kw.isEmpty else { return false }
+    searchSession += 1
+    self.keyword = kw
+    searching = true; error = nil; showingHot = false
+    return true
+  }
+
+  private func search(
+    _ fn: @Sendable (String, Int, Int) async throws -> (items: [MusicInfo], total: Int),
+    keyword: String,
+    page: Int,
+    limit: Int
+  ) async {
+    guard start(keyword: keyword) else { return }
+    let session = searchSession
     defer { searching = false }
     do {
-      // 默认走酷我搜索（注册表首个可搜索源，保持历史行为）
-      guard let fn = SourceRegistry.searchable.first?.search else { return }
-      let r = try await fn(kw, page, limit)
+      let r = try await fn(keyword, page, limit)
+      guard session == searchSession else { return } // 已发起新一轮搜索，丢弃过期结果
       self.results = r.items
       self.total = r.total
       self.showingHot = false
@@ -187,9 +210,13 @@ final class SearchService {
 
   /// 全源聚合搜索（并发，单源失败不影响其他源；源来自注册表）
   func searchAll(keyword: String) async {
-    let kw = keyword.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !kw.isEmpty else { return }
-    searching = true; error = nil; showingHot = false
+    await search(keyword: keyword)
+  }
+
+  private func search(keyword: String) async {
+    guard start(keyword: keyword) else { return }
+    let kw = self.keyword
+    let session = searchSession
     defer { searching = false }
     let order = Dictionary(uniqueKeysWithValues: SourceRegistry.searchable.map { ($0.id, $0.sortOrder) })
     let jobs: [SearchJob] = SourceRegistry.searchable.compactMap { cap in
@@ -211,6 +238,7 @@ final class SearchService {
       for await p in group { acc.append(p) }
       return acc
     }
+    guard session == searchSession else { return } // 已发起新一轮搜索，丢弃过期结果
     // 注册表顺序稳定排列，扁平化给 results（保留 source 徽标），分组给 multiResults
     let sorted = parts.sorted { $0.order < $1.order }
     multiResults = sorted.compactMap { p in MusicSource(rawValue: p.id).map { ($0, p.items) } }
