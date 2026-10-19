@@ -310,6 +310,7 @@ final class PlayerStore {
     isPlaying = false
     resolvedUrl = nil
     status = message
+    AudioPulse.shared.detach()
   }
 
   /// 播完按模式切歌（对标 core/music 队列逻辑）
@@ -319,10 +320,12 @@ final class PlayerStore {
       player.seek(to: .zero)
       player.playImmediately(atRate: 1)
       isPlaying = true
+      AudioPulse.shared.setPlaying(true)
       status = "正在播放 \(current?.name ?? "")"
     case .shuffle:
       guard !queue.isEmpty else {
         isPlaying = false
+        AudioPulse.shared.detach()
         status = "播放结束"
         return
       }
@@ -333,11 +336,13 @@ final class PlayerStore {
         play(queue[index + 1])
       } else {
         isPlaying = false
+        AudioPulse.shared.detach()
         status = "播放结束"
       }
     case .loopAll:
       guard !queue.isEmpty else {
         isPlaying = false
+        AudioPulse.shared.detach()
         status = "播放结束"
         return
       }
@@ -374,6 +379,7 @@ final class PlayerStore {
     if playerFailed || player.status == .failed { replacePlayer() }
     player.pause()
     installCurrentItem(nil)
+    AudioPulse.shared.detach()
     current = song
     playbackState = .loading
     isPlaying = false
@@ -390,6 +396,7 @@ final class PlayerStore {
     let deviceRemoved = !OutputRouteMonitor.deviceStillConnected(OutputRouteMonitor.previousDeviceID)
     player.pause()
     isPlaying = false
+    AudioPulse.shared.setPlaying(false)
     status = deviceRemoved ? "输出设备已断开，已暂停" : "输出设备已切换，已暂停"
   }
 
@@ -402,11 +409,13 @@ final class PlayerStore {
         rewindIfNeeded()
         player.playImmediately(atRate: 1)
         isPlaying = true
+        AudioPulse.shared.setPlaying(true)
         status = "正在播放 \(current?.name ?? "")"
       }
     } else if isPlaying {
       player.pause()
       isPlaying = false
+      AudioPulse.shared.setPlaying(false)
       status = "已暂停"
     }
   }
@@ -415,6 +424,7 @@ final class PlayerStore {
     if isPlaying {
       player.pause()
       isPlaying = false
+      AudioPulse.shared.setPlaying(false)
       status = "已暂停"
       return
     }
@@ -426,6 +436,7 @@ final class PlayerStore {
     rewindIfNeeded()
     player.playImmediately(atRate: 1)
     isPlaying = true
+    AudioPulse.shared.setPlaying(true)
     status = "正在播放 \(current?.name ?? "")"
   }
 
@@ -469,6 +480,7 @@ final class PlayerStore {
     progress = 0
     currentTime = 0
     isPlaying = true
+    AudioPulse.shared.setPlaying(true)
     status = "正在播放 \(current.name)"
   }
 
@@ -493,6 +505,7 @@ final class PlayerStore {
   func setVolume(_ value: Double) {
     volume = max(0, min(1, value))
     player.volume = Float(volume)
+    AudioPulse.shared.setGate(volume)
   }
 
   // MARK: resolve
@@ -539,6 +552,10 @@ final class PlayerStore {
       }
       let item = AVPlayerItem(url: url)
       installCurrentItem(item)
+      // 随心听律动：旁路二次解码接上真实流地址（失败自动落模拟律动，不影响播放）
+      AudioPulse.shared.attach(urlString: s)
+      AudioPulse.shared.setPlaying(true)
+      AudioPulse.shared.setGate(volume)
       player.playImmediately(atRate: 1)
       isPlaying = true
       status = "正在准备 \(played.name)"

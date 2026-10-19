@@ -158,7 +158,7 @@
       "name": "Random Listen Module",
       "kind": "custom",
       "refersTo": "random-listen-module",
-      "description": "主页单个方形卡片的随心听：点击从候选池随机开始，状态走辅助功能与进度语义。",
+      "description": "主页单个方形卡片的随心听：点击从候选池随机开始，状态走辅助功能与进度语义；底层的律动 shader 背景与 2D 精灵宠物（社区素材，含出处致谢）为纯装饰，点击穿透且不进入无障碍树。",
       "html": "<section class=\"ds-random-listen-module\"><button class=\"ds-module-icon\" aria-label=\"随心听，开始随机播放\" aria-describedby=\"ds-module-hint\"><span aria-hidden=\"true\">shuffle</span></button><p id=\"ds-module-hint\" class=\"sr-only\">从候选池随机开始，不设抽取上限</p></section>",
       "css": ".ds-random-listen-module { width: 168px; padding: 14px; border-radius: 8px; background: #181B19; color: #F4F7F5; font-family: -apple-system, BlinkMacSystemFont, sans-serif; } .ds-random-listen-module .ds-module-icon { display: grid; place-items: center; width: 100%; aspect-ratio: 1; border: 0; border-radius: 8px; background: #181B19; color: #B7BDB9; font: 600 26px -apple-system, BlinkMacSystemFont, sans-serif; cursor: pointer; transition: background 180ms cubic-bezier(0.22, 1, 0.36, 1); } .ds-random-listen-module .ds-module-icon:hover { background: #282C2A; color: #F4F7F5; } .ds-random-listen-module .ds-module-icon:focus-visible { outline: 3px solid #F4F7F5; outline-offset: 2px; } .ds-random-listen-module .ds-module-icon:disabled { color: #6D7370; cursor: default; } .ds-random-listen-module .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }"
     },

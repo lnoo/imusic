@@ -676,27 +676,46 @@ private struct RandomListenModule: View {
   var body: some View {
     Button(action: performPrimaryAction) {
       ZStack {
+        // 底层：音乐律动 shader 背景（自走 PulseBus，无需 SwiftUI 状态驱动）
+        PulseShaderView()
+          .allowsHitTesting(false)
+        // 中层：流萤精灵宠物，播放小跑、随节拍弹跳、切歌招手
+        MascotSpriteView()
+          .allowsHitTesting(false)
+          .padding(6)
+        // 顶层：进度/失败/禁用仍需图标化状态语义（不靠颜色单独传达）
         if phase.showsProgress {
           ProgressView()
             .controlSize(.regular)
-            .tint(Theme.text2)
-        } else {
+            .tint(Theme.text)
+        } else if phase == .loadFailed || phase == .failed {
+          Image(systemName: "exclamationmark.triangle.fill")
+            .font(.system(size: 22, weight: .semibold))
+            .foregroundStyle(.white)
+            .padding(8)
+            .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(.black.opacity(0.45)))
+        } else if isDisabled {
           Image(systemName: phase.symbol)
-            .font(.system(size: 26, weight: .semibold))
-            .foregroundStyle(isDisabled ? Theme.text2 : Theme.text)
+            .font(.system(size: 20, weight: .semibold))
+            .foregroundStyle(.white.opacity(0.85))
+            .padding(8)
+            .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(.black.opacity(0.35)))
         }
       }
-      .padding(14)
       .frame(width: 168, height: 168)
       .background(
         RoundedRectangle(cornerRadius: Theme.radiusCard, style: .continuous)
           .fill(isHot ? Theme.cardHover : Theme.card)
       )
+      .clipShape(RoundedRectangle(cornerRadius: Theme.radiusCard, style: .continuous))
       .contentShape(RoundedRectangle(cornerRadius: Theme.radiusCard, style: .continuous))
     }
     .buttonStyle(.plain)
     .disabled(isDisabled)
-    .onHover { isHovered = $0 && !isDisabled }
+    .onHover {
+      isHovered = $0 && !isDisabled
+      AudioPulse.shared.setHovered($0 && !isDisabled)
+    }
     .focused($isFocused)
     .focusEffectDisabled()
     .overlay {
@@ -710,6 +729,11 @@ private struct RandomListenModule: View {
     .accessibilityLabel(accessibilityText)
     .accessibilityValue(controlLabel)
     .accessibilityHint(controlLabel)
+    .onDisappear { AudioPulse.shared.setHovered(false) }
+    .task(id: phase) {
+      // 状态联动 shader：禁用降饱和、失败飘红
+      AudioPulse.shared.setVisual(disabled: phase == .poolEmpty, error: phase == .loadFailed || phase == .failed)
+    }
   }
 
   private func uniqueSongs(_ songs: [MusicInfo]) -> [MusicInfo] {

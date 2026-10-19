@@ -22,6 +22,10 @@ iMusic/
   SourceRegistry.swift    # 源能力注册表（对标 musicSdk/index.js；加新源只改此一处）
   Boards.swift            # kg/tx/wy/mg 真实榜单（对标各源 musicSdk/*/leaderboard.js）
   HomeView.swift          # 主页发现页（Hero/资料库总览/多源榜单/随心听/推荐，默认落地页）
+  AudioPulse.swift        # 随心听律动信号：AVAssetReader 旁路二次解码 + vDSP FFT 三频带 + 节拍检测（无音频落 104BPM 模拟律动）
+  RandomListenMascot.swift# 随心听卡片视觉：Metal 律动 shader 背景 + 「流萤」2D 精灵宠物（播放小跑、随拍弹跳、切歌招手；素材见文件头致谢）
+  Shaders.metal           # 卡片背景 fragment（渐变光斑 + 拍涟漪，随低/中/高频与响度律动，无噪声场）
+  firefly_spritesheet.webp# 「流萤」精灵图集（8×9 行动作网格，CC BY-NC 4.0，作者 legeling)
   PlayerStore.swift       # 取URL/降级/AVPlayer（对标 core/music/online.ts + useInitUserApi）
   App.swift               # setUserApi 胶水（对标 core/apiSource.ts + useSettingSync）
   Views.swift             # 搜索/播放条/正在播放
