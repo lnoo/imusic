@@ -1,8 +1,12 @@
 import Foundation
 
-// MARK: - 源能力注册表（对标 musicSdk/index.js sources + 各源 index.js 统一接口）
-// 加新源只需：MusicSource 加一个 case + registerBuiltins 加一行 register，
+// MARK: - 源能力注册表（对标 any-listen ResourceAction 契约的宿主侧）
+// 加新源只需：MusicSource 加一个 case + buildBuiltins 加一行 register，
 // 搜索/榜单/歌词/封面/设置页/主页全部自动出现，不再满屏 switch。
+//
+// 各闭包均委托 any-listen 解析层（AnyListenResource → AnyListen{Kw,Kg,Tx,Wy,Mg}）：
+//   search  musicSearch | board  topSongsDetail（固定默认榜，主页目录另见 HomeBoards）
+//   lyric   musicLyric  | pic    musicPic     | fallbackUrl  musicUrl（GD音乐台同源兜底）
 
 /// 单源能力。nil 表示该源不支持该能力（对标上游按模块有无判断，如 `sm.musicSearch`）。
 struct SourceCapability: Sendable {
@@ -16,58 +20,82 @@ struct SourceCapability: Sendable {
   var board: (@Sendable (Int) async throws -> [MusicInfo])?
   var lyric: (@Sendable (MusicInfo) async throws -> LyricInfo?)?
   var pic: (@Sendable (MusicInfo) async -> String?)?
-  var fallbackUrl: (@Sendable (String, MusicQuality) -> String?)?
+  /// 播放直链兜底（对标 any-listen musicUrl；主路径仍是 LX 自定义源脚本）
+  var fallbackUrl: (@Sendable (MusicInfo, MusicQuality) async -> ALMusicUrlInfo?)?
 }
 
 enum SourceRegistry {
   /// 内置源表（一次性不可变构建，天然线程安全；加新源只改 buildBuiltins 一处）
   static let all: [SourceCapability] = buildBuiltins()
 
+  /// 解析层搜索闭包适配（AnyListenResource.musicSearch → 注册表签名）
+  private static func searchVia(_ source: MusicSource) -> @Sendable (String, Int, Int) async throws -> (items: [MusicInfo], total: Int) {
+    { keyword, page, limit in
+      let r = try await AnyListenResource.musicSearch(source: source, name: keyword, page: page, limit: limit)
+      return (r.list, r.total)
+    }
+  }
+
+  /// 默认榜闭包（各源热歌榜；主页多榜目录见 HomeBoards）
+  private static func boardVia(_ source: MusicSource, defaultBoardId: String) -> @Sendable (Int) async throws -> [MusicInfo] {
+    { limit in
+      let r = try await AnyListenResource.topSongsDetail(source: source, id: defaultBoardId, limit: limit)
+      return r.list
+    }
+  }
+
   private static func buildBuiltins() -> [SourceCapability] {
     [
       SourceCapability(
         id: "kw", displayName: "酷我", systemImage: "music.note", sortOrder: 0,
-        supportQualitys: [.q128k],
-        search: { keyword, page, limit in
-          let r = try await KwSearch.search(keyword: keyword, page: page, limit: limit)
-          return (r.items, r.total)
-        },
-        board: KwBoard.hotSongs,
-        lyric: { await OfficialLyric.kw($0) },
-        pic: OfficialPic.kwPic,
-        fallbackUrl: KwFallback.url
+        supportQualitys: [.q128k], // www playUrl 兜底仅 128k；更高档位走自定义源
+        search: searchVia(.kw),
+        board: boardVia(.kw, defaultBoardId: "16"),
+        lyric: { try await AnyListenResource.musicLyric(source: .kw, music: $0) },
+        pic: { await AnyListenResource.musicPic(source: .kw, music: $0) },
+        fallbackUrl: { music, quality in
+          await AnyListenResource.musicUrl(source: .kw, music: music, quality: quality)
+        }
       ),
       SourceCapability(
         id: "kg", displayName: "酷狗", systemImage: "music.note.list", sortOrder: 1,
         supportQualitys: MusicQuality.highToLow,
-        search: KgSearch.search,
-        board: KgBoard.hotSongs,
-        lyric: { await OfficialLyric.kg($0) },
-        pic: nil // 搜索/榜单无图，OfficialPic 默认走 song.picUrl（即无）
+        search: searchVia(.kg),
+        board: boardVia(.kg, defaultBoardId: "8888"),
+        lyric: { try await AnyListenResource.musicLyric(source: .kg, music: $0) },
+        pic: { await AnyListenResource.musicPic(source: .kg, music: $0) },
+        fallbackUrl: nil // kg 无公开直链（对标 any-listen：由 LX 自定义源提供）
       ),
       SourceCapability(
         id: "tx", displayName: "QQ音乐", systemImage: "play.circle", sortOrder: 2,
         supportQualitys: MusicQuality.highToLow,
-        search: TxSearch.search,
-        board: TxBoard.hotSongs,
-        lyric: nil, // QRC 加密，MVP 仅走自定义源（对标 tx/lyric.js 注释）
-        pic: nil // 搜索自带图，走 song.picUrl
+        search: searchVia(.tx),
+        board: boardVia(.tx, defaultBoardId: "26"),
+        lyric: { try await AnyListenResource.musicLyric(source: .tx, music: $0) },
+        pic: { await AnyListenResource.musicPic(source: .tx, music: $0) },
+        fallbackUrl: { music, quality in
+          await AnyListenResource.musicUrl(source: .tx, music: music, quality: quality) // GD音乐台同源兜底
+        }
       ),
       SourceCapability(
         id: "wy", displayName: "网易云", systemImage: "cloud", sortOrder: 3,
         supportQualitys: MusicQuality.highToLow,
-        search: WySearch.search,
-        board: WyBoard.hotSongs,
-        lyric: OfficialLyric.wy,
-        pic: nil // 搜索自带图
+        search: searchVia(.wy),
+        board: boardVia(.wy, defaultBoardId: "3778678"),
+        lyric: { try await AnyListenResource.musicLyric(source: .wy, music: $0) },
+        pic: { await AnyListenResource.musicPic(source: .wy, music: $0) },
+        fallbackUrl: { music, quality in
+          await AnyListenResource.musicUrl(source: .wy, music: music, quality: quality) // GD音乐台同源兜底
+        }
       ),
       SourceCapability(
         id: "mg", displayName: "咪咕", systemImage: "radio", sortOrder: 4,
         supportQualitys: MusicQuality.highToLow,
-        search: MgSearch.search,
-        board: MgBoard.hotSongs,
-        lyric: nil, // MRC 加密，MVP 仅走自定义源
-        pic: nil // 搜索自带图
+        search: searchVia(.mg),
+        board: boardVia(.mg, defaultBoardId: "27186466"),
+        lyric: { try await AnyListenResource.musicLyric(source: .mg, music: $0) },
+        pic: { await AnyListenResource.musicPic(source: .mg, music: $0) },
+        fallbackUrl: nil // mg 无公开直链（对标 any-listen：由 LX 自定义源提供）
       ),
       SourceCapability(
         id: "local", displayName: "本地", systemImage: "internaldrive", sortOrder: 99,

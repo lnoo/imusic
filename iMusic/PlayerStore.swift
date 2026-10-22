@@ -538,10 +538,13 @@ final class PlayerStore {
           }
         }
       }
-      // 2) MVP兜底：注册表 fallbackUrl（kw 官方试听直链；若无自定义源也能播；对标内置 api-temp 思路）
-      if urlStr == nil {
-        urlStr = SourceRegistry.capability(id: song.source.rawValue)?.fallbackUrl?(song.songmid, q)
-        status = "内置兜底解析中"
+      // 2) MVP兜底：注册表 fallbackUrl（对标 any-listen musicUrl；kw www playUrl 签名直链 /
+      //    wy·tx 走 GD音乐台同源接口；无自定义源或脚本失败时兜底可播）
+      if urlStr == nil, song.source != .local {
+        if let info = await SourceRegistry.capability(id: song.source.rawValue)?.fallbackUrl?(song, q) {
+          urlStr = info.url
+          status = "内置兜底解析中"
+        }
       }
       guard token == playToken else { return }
       guard let s = urlStr, let url = URL(string: s) else { throw NSError(domain: "LX", code: -1, userInfo: [NSLocalizedDescriptionKey: "无可用播放链接"]) }
@@ -727,15 +730,5 @@ final class OutputRouteMonitor {
     Self.previousDeviceID = activeDeviceID
     activeDeviceID = newID
     onChange?()
-  }
-}
-
-/// 酷我直链兜底（公开移动端试听接口，MVP可用；正式使用请以自定义源返回为准）
-enum KwFallback {
-  static func url(songmid: String, quality: MusicQuality) -> String? {
-    // anti.s 等需要签名，MVP用最简的 player 试听地址簇：
-    // https://m.kuwo.cn/newh5/singles/songinfoandlrc?musicId=<mid> 可拿到试听url（此处直接返回 info 接口由 AVPlayer 跟随？不行）
-    // 为保证可播，返回 kuwo 跨端 mostable 302 链接：
-    "https://er.sycdn.kuwo.cn/\(songmid.prefix(2))/\(songmid)/audio.mp3"
   }
 }

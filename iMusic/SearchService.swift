@@ -2,9 +2,8 @@ import Foundation
 import Observation
 
 // MARK: - SearchService
-// 对标 src/renderer/utils/musicSdk/kw/musicSearch.js
-// 原项目搜索不受自定义源影响，直调各官站 HTTP；MVP 先实现 kw（酷我）搜索 + 结果归一化。
-// URL: http://search.kuwo.cn/r.s?client=kt&all=...&pn=&rn=&...&rformat=json
+// 搜索会话编排层（UI 可观察状态不变）。各源实际解析位于 AnyListen{Kw,Kg,Tx,Wy,Mg}.swift，
+// 经 SourceRegistry 闭包接入（对标 any-listen app/modules/resources/musicSearch 的分发方式）。
 
 @Observable @MainActor
 final class SearchService {
@@ -18,9 +17,7 @@ final class SearchService {
   /// 同时用于丢弃过期的并发结果（晚返回的旧请求不应覆盖新查询）。
   var searchSession = 0
 
-  /// 默认榜单（打开即有歌，不知道搜啥也能直接点）
-  /// 对标 kw/leaderboard.js 的榜单概念，但榜单详情接口需 wbdCrypto 签名，
-  /// MVP 用免签名的老接口 kbangserver（桌面端注释里保留的 getUrl 同源）。
+  /// 默认榜单（打开即有歌，不知道搜啥也能直接点）：酷我热歌榜（any-listen topSongs 同源）
   var hot: [MusicInfo] = []
   var hotLoading = false
   var showingHot = true
@@ -290,135 +287,5 @@ final class SearchService {
     let nameHit = norm(item.name).contains(norm(song.name)) || norm(song.name).contains(norm(item.name))
     guard nameHit else { return 0 }
     return norm(item.singer).contains(norm(song.singer)) || norm(song.singer).contains(norm(item.singer)) ? 2 : 1
-  }
-}
-
-struct KwSearchResponse {
-  var items: [MusicInfo]
-  var total: Int
-}
-
-enum KwSearch {
-  static func search(keyword: String, page: Int, limit: Int) async throws -> KwSearchResponse {
-    var c = URLComponents(string: "http://search.kuwo.cn/r.s")!
-    c.queryItems = [
-      .init(name: "client", value: "kt"),
-      .init(name: "all", value: keyword),
-      .init(name: "pn", value: "\(page - 1)"),
-      .init(name: "rn", value: "\(limit)"),
-      .init(name: "uid", value: "794762570"),
-      .init(name: "ver", value: "kwplayer_ar_9.2.2.1"),
-      .init(name: "vipver", value: "1"),
-      .init(name: "show_copyright_off", value: "1"),
-      .init(name: "newver", value: "1"),
-      .init(name: "ft", value: "music"),
-      .init(name: "cluster", value: "0"),
-      .init(name: "strategy", value: "2012"),
-      .init(name: "encoding", value: "utf8"),
-      .init(name: "rformat", value: "json"),
-      .init(name: "vermerge", value: "1"),
-      .init(name: "mobi", value: "1"),
-      .init(name: "issubtitle", value: "1"),
-    ]
-    var req = URLRequest(url: c.url!, timeoutInterval: 15)
-    req.setValue("Mozilla/5.0 (Macintosh)", forHTTPHeaderField: "User-Agent")
-    req.setValue("http://www.kuwo.cn/", forHTTPHeaderField: "Referer")
-    let (data, _) = try await URLSession.shared.data(for: req)
-    guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-      throw NSError(domain: "LX", code: -1, userInfo: [NSLocalizedDescriptionKey: "搜索返回解析失败"])
-    }
-    let total = Int("\(json["TOTAL"] ?? "0")") ?? 0
-    let abslist = json["abslist"] as? [[String: Any]] ?? []
-    let items = abslist.compactMap { handleOne($0) }
-    return KwSearchResponse(items: items, total: total)
-  }
-
-  // 复刻 handleResult：N_MINFO 解析 level/bitrate/format/size -> 128k/320k/flac/flac24bit
-  private static func handleOne(_ info: [String: Any]) -> MusicInfo? {
-    guard let rid = info["MUSICRID"] as? String,
-          let nminfo = info["N_MINFO"] as? String else { return nil }
-    let songId = rid.replacingOccurrences(of: "MUSIC_", with: "")
-    var quals: [MusicQualityType] = []
-    // level:xxx,bitrate:xxx,format:xxx,size:xxx  (format 4000/2000/320/128)
-    let rxp = try! NSRegularExpression(pattern: #"level:(\w+),bitrate:(\d+),format:(\w+),size:([\w.]+)"#)
-    let ns = nminfo as NSString
-    for m in rxp.matches(in: nminfo, range: NSRange(location: 0, length: ns.length)) {
-      let format = ns.substring(with: m.range(at: 3))
-      let size = ns.substring(with: m.range(at: 4))
-      switch format {
-      case "4000": quals.append(.init(type: .flac24bit, size: size.uppercased()))
-      case "2000": quals.append(.init(type: .flac, size: size.uppercased()))
-      case "320": quals.append(.init(type: .q320k, size: size.uppercased()))
-      case "128": quals.append(.init(type: .q128k, size: size.uppercased()))
-      default: break
-      }
-    }
-    quals.reverse() // 原项目 types.reverse()（高音质在前）
-    let intervalSec = Int("\(info["DURATION"] ?? "0")") ?? 0
-    return MusicInfo(
-      name: decode("\(info["SONGNAME"] ?? "")"),
-      singer: decode("\(info["ARTIST"] ?? "")").replacingOccurrences(of: "&", with: ","),
-      source: .kw,
-      songmid: songId,
-      albumName: decode("\(info["ALBUM"] ?? "")"),
-      interval: formatTime(intervalSec),
-      qualitys: quals.isEmpty ? [.init(type: .q128k, size: nil)] : quals
-    )
-  }
-
-  private static func decode(_ s: String) -> String {
-    // 原项目 decodeName：主要是 HTML 反转义
-    s.replacingOccurrences(of: "&nbsp;", with: " ")
-      .replacingOccurrences(of: "&amp;", with: "&")
-      .replacingOccurrences(of: "&lt;", with: "<")
-      .replacingOccurrences(of: "&gt;", with: ">")
-      .replacingOccurrences(of: "&quot;", with: "\"")
-  }
-
-  private static func formatTime(_ sec: Int) -> String {
-    guard sec > 0 else { return "00:00" }
-    return String(format: "%02d:%02d", sec / 60, sec % 60)
-  }
-}
-
-// MARK: - 酷我榜单（免签名老接口，对标 leaderboard.js 注释里的 getUrl；bangid 参数化）
-// 官方 boardList 40+，这里收录最常用的推荐/飙升/新歌/场景/风格/怀旧榜（curl 逐个实测有数）。
-enum KwBoard {
-  /// bangid 16 = 热歌榜（默认）
-  static func hotSongs(limit: Int = 30) async throws -> [MusicInfo] {
-    try await songs(bangid: "16", limit: limit)
-  }
-
-  static func songs(bangid: String, limit: Int = 30) async throws -> [MusicInfo] {
-    let url = URL(string: "http://kbangserver.kuwo.cn/ksong.s?from=pc&fmt=json&pn=0&rn=\(limit)&type=bang&data=content&id=\(bangid)&show_copyright_off=0&pcmp4=1&isbang=1")!
-    var req = URLRequest(url: url, timeoutInterval: 15)
-    req.setValue("Mozilla/5.0 (Macintosh)", forHTTPHeaderField: "User-Agent")
-    let (data, _) = try await URLSession.shared.data(for: req)
-    guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-          let list = json["musiclist"] as? [[String: Any]] else {
-      throw NSError(domain: "LX", code: -1, userInfo: [NSLocalizedDescriptionKey: "热榜解析失败"])
-    }
-    return list.compactMap { map($0) }
-  }
-
-  private static func map(_ m: [String: Any]) -> MusicInfo? {
-    guard let id = m["id"] as? String, !id.isEmpty else { return nil }
-    // formats 形如 "MP3128|ALFLAC|MP3H|..."，映射音质（高→低）
-    let formats = ((m["formats"] as? String) ?? "").components(separatedBy: "|")
-    var quals: [MusicQualityType] = []
-    if formats.contains("ALFLAC") { quals.append(.init(type: .flac, size: nil)) }
-    if formats.contains("MP3H") { quals.append(.init(type: .q320k, size: nil)) }
-    if formats.contains("MP3128") { quals.append(.init(type: .q128k, size: nil)) }
-    if quals.isEmpty { quals = [.init(type: .q128k, size: nil)] }
-    let secs = Int("\(m["song_duration"] ?? m["duration"] ?? "0")") ?? 0
-    return MusicInfo(
-      name: "\(m["name"] ?? "")",
-      singer: "\(m["artist"] ?? "")",
-      source: .kw,
-      songmid: id,
-      albumName: "\(m["album"] ?? "")",
-      interval: String(format: "%02d:%02d", secs / 60, secs % 60),
-      qualitys: quals
-    )
   }
 }

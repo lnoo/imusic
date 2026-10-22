@@ -4,7 +4,8 @@ import CommonCrypto
 
 // MARK: - 签名与格式化小工具
 // 对标：renderer/utils/index.ts(sizeFormate/formatPlayTime/decodeName)
-//      tx/utils/crypto.js(zzcSign) / wy/utils/crypto.js(eapi) / mg/musicSearch.js(createSignature)
+//      wy/utils/crypto.js(eapi) / mg/musicSearch.js(createSignature)
+//      （tx zzcSign 签名随 DoSearchForQQMusicDesktop 端点失效一并下线，改走免签名的 DoSearchForQQMusicMobile）
 
 enum iMusicSign {
   static func md5(_ s: String) -> String {
@@ -30,14 +31,12 @@ enum iMusicSign {
     return String(format: "%.2fG", b / 1024 / 1024 / 1024)
   }
 
-  /// HTML 反转义（对标 decodeName）
+  /// HTML 反转义（对标 decodeName；原实现实体字面量损坏导致整串替换失效，本次修复）
   static func decode(_ s: String) -> String {
-    s.replacingOccurrences(of: "&nbsp;", with: " ")
-      .replacingOccurrences(of: "&", with: "&")
-      .replacingOccurrences(of: "<", with: "<")
-      .replacingOccurrences(of: ">", with: ">")
-      .replacingOccurrences(of: "", with: "\"")
-      .replacingOccurrences(of: "&#039;", with: "'")
+    let entities = [("&nbsp;", " "), ("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"), ("&quot;", "\""), ("&39;", "'"), ("&#039;", "'")]
+    var out = s
+    for (e, v) in entities { out = out.replacingOccurrences(of: e, with: v) }
+    return out
   }
 
   static func mmss(_ sec: Int) -> String {
@@ -47,62 +46,6 @@ enum iMusicSign {
 
   static func singerNames(_ arr: [[String: Any]]) -> String {
     arr.compactMap { $0["name"] as? String }.joined(separator: "、")
-  }
-
-  // MARK: - Deterministic JSON for tx (matches Node JSON.stringify insertion order)
-  private static func txJSONString(_ obj: [String: Any], keyOrder: [String]) -> String {
-    var parts: [String] = []
-    for k in keyOrder {
-      if let v = obj[k] {
-        parts.append("\"\(k)\":\(jsonValue(v))")
-      }
-    }
-    return "{" + parts.joined(separator: ",") + "}"
-  }
-
-  private static func jsonValue(_ v: Any) -> String {
-    if let s = v as? String { return "\"\(s.replacingOccurrences(of: "\"", with: "\\\""))\"" }
-    if let n = v as? NSNumber {
-      if n === kCFBooleanTrue || n === kCFBooleanFalse { return n.boolValue ? "true" : "false" }
-      return n.stringValue
-    }
-    if let i = v as? Int { return "\(i)" }
-    if let d = v as? Double { return "\(d)" }
-    if let arr = v as? [Any] { return "[" + arr.map(jsonValue).joined(separator: ",") + "]" }
-    if let dict = v as? [String: Any] {
-      let keys = dict.keys.sorted()
-      return "{" + keys.map { "\"\($0)\":\(jsonValue(dict[$0]!))" }.joined(separator: ",") + "}"
-    }
-    return "null"
-  }
-
-  // Expose for MultiSource
-  static func txSignPayload(comm: [String: Any], searchSvc: [String: Any], param: [String: Any]) -> String {
-    let searchSvcStr = txJSONString(searchSvc, keyOrder: searchKeyOrder)
-    let commStr = txJSONString(comm, keyOrder: commKeyOrder)
-    return "{\"comm\":" + commStr + ",\"music.search.SearchCgiService\":" + searchSvcStr + "}"
-  }
-
-  static let commKeyOrder = ["_channelid", "_os_version", "ct", "cv", "guid", "patch", "psrf_access_token_expiresAt", "psrf_qqaccess_token", "psrf_qqopenid", "psrf_qqunionid", "tmeAppID", "tmeLoginType", "uin", "wid"]
-  static let searchKeyOrder = ["module", "method", "param"]
-  static let paramKeyOrder = ["grp", "num_per_page", "page_num", "query", "remoteplace", "search_type", "searchid"]
-
-  // MARK: - tx zzcSign（对标 tx/utils/crypto.js，纯 SHA1+查表，无需网络）
-  static func zzcSign(_ text: String) -> String {
-    let hash = sha1(text)
-    let chars = Array(hash)
-    let p1idx = [23, 14, 6, 36, 16, 40, 7, 19]
-    let p2idx = [16, 1, 32, 12, 19, 27, 8, 5]
-    let scramble = [89, 39, 179, 150, 218, 82, 58, 252, 177, 52, 186, 123, 120, 64, 242, 133, 143, 161, 121, 179]
-    let part1 = p1idx.map { $0 < chars.count ? String(chars[$0]) : "" }.joined()
-    let part2 = p2idx.map { $0 < chars.count ? String(chars[$0]) : "" }.joined()
-    var bytes: [UInt8] = []
-    for (i, v) in scramble.enumerated() {
-      let hex = String(chars[(i * 2)..<(i * 2 + 2)])
-      bytes.append(UInt8(v ^ Int(UInt8(hex, radix: 16) ?? 0)))
-    }
-    let b64 = Data(bytes).base64EncodedString().replacingOccurrences(of: "[\\/+=]", with: "", options: .regularExpression)
-    return "zzc\(part1)\(b64)\(part2)".lowercased()
   }
 
   // MARK: - wy eapi（对标 wy/utils/crypto.js eapi；搜索/歌词只用 eapi，无需 RSA）

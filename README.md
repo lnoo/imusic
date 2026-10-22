@@ -1,6 +1,8 @@
 # iMusic（SwiftUI 原生 Spotify 深色版）
 
-macOS 原生客户端，采用 **Spotify 深色设计语言（Encore 风格）** 打造，**源处理逻辑 1:1 复刻 `lx-music-desktop`**。
+macOS 原生客户端，采用 **Spotify 深色设计语言（Encore 风格）** 打造，
+**音源底层解析严格对齐 `any-listen` 的资源动作契约与数据模型**（搜索/歌单/榜单/歌词/封面），
+自定义源脚本（LX 音源）通道保持 `lx-music` 系兼容。
 标准 Xcode macOS App 工程（macOS 27+，Swift 6）。
 
 ```bash
@@ -14,13 +16,21 @@ xcodebuild -project iMusic.xcodeproj -scheme iMusic -configuration Debug build
 
 ```
 iMusic/
-  Models.swift            # MusicSource/Quality/MusicInfo/UserApiInfo（对标 common/types）
+  Models.swift            # MusicSource/Quality/MusicInfo/UserApiInfo（对标 any-listen MusicInfoOnline 映射）
+  AnyListenResource.swift # any-listen 解析契约层：资源动作分发 + 归一化（br↔音质/去重/播放量）+ ALHttp/GD兜底
+  AnyListenKw.swift       # 酷我解析：搜索/榜单/歌词(lrcx逐字解码)/封面/Secret签名 playUrl 兜底
+  AnyListenKg.swift       # 酷狗解析：搜索(带封面)/56榜单目录/歌词(krc逐字解码)/歌单搜索+详情
+  AnyListenTx.swift       # QQ解析：免签名搜索/榜单/歌单(标签+浏览+详情)/歌词(QRC三重DES解码)
+  AnyListenWy.swift       # 网易解析：eapi搜索+明文兜底/歌单全链/榜单/歌词/热搜
+  AnyListenMg.swift       # 咪咕解析：签名搜索/榜单/歌词(lrcUrl)/封面
+  LyricCodec.swift        # 加密歌词解码：kg-KRC / tx-QRC(pyqdes) / zlib
+  LyricService.swift      # LrcParser + OfficialLyric/OfficialPic（→ AnyListenResource 统一入口）
   SourceScriptParser.swift# parseScriptInfo/matchInfo + gz_+base64（对标 main/modules/userApi/utils.ts）
   UserApiStore.swift      # 导入/删除/选择/持久化（对标 UserApiModal + store.ts）
-  UserApiEngine.swift     # JS 沙箱 lx.*（对标 renderer/preload.js + main.ts）
+  UserApiEngine.swift     # JS 沙箱 lx.*（对标 renderer/preload.js + main.ts；对标 any-listen lx-api-source-loader）
   SearchService.swift     # 搜索+榜单聚合（读 SourceRegistry，不写死源）
-  SourceRegistry.swift    # 源能力注册表（对标 musicSdk/index.js；加新源只改此一处）
-  Boards.swift            # kg/tx/wy/mg 真实榜单（对标各源 musicSdk/*/leaderboard.js）
+  SourceRegistry.swift    # 源能力注册表（对标 any-listen ResourceAction 宿主侧；加新源只改此一处）
+  Boards.swift            # 主页榜单目录 + HomeBoardFetcher（→ topSongsDetail 解析层）
   HomeView.swift          # 主页发现页（Hero/资料库总览/多源榜单/随心听/推荐，默认落地页）
   AudioPulse.swift        # 随心听律动信号：AVAssetReader 旁路二次解码 + vDSP FFT 三频带 + 节拍检测（无音频落 104BPM 模拟律动）
   RandomListenMascot.swift# 随心听卡片视觉：Metal 律动 shader 背景 + 「流萤」2D 精灵宠物（播放小跑、随拍弹跳、切歌招手；素材见文件头致谢）
@@ -33,11 +43,23 @@ iMusic/
 demo-source.js            # 可直接导入联调的最小源脚本
 ```
 
-## 加新源（对标 musicSdk/index.js 注册表模式）
+## 音源底层解析（严格对齐 any-listen）
+
+契约与数据模型复刻自 `@any-listen/`（any-listen 仓库 `packages/shared/types`）：
+
+- **资源动作**：`musicSearch / songlistTags·sorts·list·search·detail / topSongs·date·detail / musicLyric / musicPic / musicUrl`，
+  入参与返回值形状与 any-listen `ResourceAction` 一致（`ListCommonResult{list,total,page,limit}`、`TopSongsItem{id,name,pic}`、`SongListItem{id,name,img,playCount,...}`）。
+- **归一化**：br↔音质桥接（999/740/320/128 ↔ flac24bit/flac/320k/128k，GD音乐台同款）、歌手「、」连接、`mm:ss` 时长、按 id 去重。
+- **加密歌词**：kg-KRC（XOR+zlib）、tx-QRC（pyqdes 三重 DES+zlib）、kw-lrcx（zlib+base64+"yeelion" XOR）在 `LyricCodec` 解码，均输出 原文/翻译/逐字(lxlyric)。
+- **分工与 any-listen 生态一致**：app 内置直连解析负责 搜索/歌单/榜单/歌词/封面；播放直链主路径走 LX 自定义源脚本（= any-listen 的 lx-api-source-loader 定位），内置兜底走 `musicUrl`（kw 为官网 Secret 签名 playUrl，wy/tx 与 GD音乐台扩展同源接口）。
+- **实测**：五源「搜索/歌单/榜单/歌词/封面」逐项实网验证全绿（见 git log 对应提交）。
+
+## 加新源（注册表模式）
 
 1. `Models.swift` `MusicSource` 加一个 case（如 `case bd`）；
-2. `SourceRegistry.swift` `buildBuiltins()` 加一行 `SourceCapability`（搜索/榜单/歌词/封面/兜底按需填，不支持填 nil）；
-3. 完成。搜索页芯片、主页榜单 Tab、换源/歌词/封面兜底、设置页能力一览全部自动出现。
+2. 新建 `AnyListenBd.swift` 实现各资源动作；
+3. `SourceRegistry.swift` `buildBuiltins()` 加一行 `SourceCapability`（按需填，不支持填 nil）；
+4. 完成。搜索页芯片、主页榜单 Tab、换源/歌词/封面兜底、设置页能力一览全部自动出现。
 
 `MusicInfo.source` 仍用 enum 做类型安全键；运行时分发一律走 `SourceRegistry`，不再写 `switch source`。
 
@@ -56,7 +78,8 @@ demo-source.js            # 可直接导入联调的最小源脚本
 | `lx.utils.crypto/md5/aes/rsa/random + buffer + zlib + currentScriptInfo + version/env` | `md5✅ randomBytes✅ aes✅(CBC/ECB,128/256) buffer.from/bufToString✅ zlib✅ currentScriptInfo✅`；**`rsaEncrypt` 未实现**（MVP抛错） | 覆盖绝大多数源（网易 weapi 需 RSA 的源暂不支持） |
 | `handleRequest` 校验：`musicUrl/pic` 须 `^https?` ≤2048；`lyric.lyric≤51200/t/r≤5120/lx≤8192`；请求 20s 超时；切源取消 | `callScript` 同校验 + 20s 超时 | 一致 |
 | `useInitUserApi` 按 `actions` 动态生成 `getMusicUrl/getLyric/getPic` + `qualityList` | `engine.sources` + `PlayerStore.pickQuality`（高→低降级） | 一致 |
-| 搜索/榜单直调官站，**不受自定义源影响** | `SearchService` 直调酷我 `search.kuwo.cn/r.s` + `handleResult` 归一化 | 先做 kw，kg/tx/wy/mg 可按同模式扩展 |
+| 搜索/歌单/榜单/歌词/封面解析 | `AnyListenResource` → 各源 `AnyListen*.swift`（any-listen 契约） | 五源全量；加密歌词内置解码 |
+| 播放直链兜底 | `musicUrl`（kw 官网 playUrl 签名 / wy·tx GD音乐台同源降级链） | 主路径仍为自定义源 |
 | `updateAlert`（log≤1024，一次） | `engine.onUpdateAlert` → 设置页弹窗 | 一致 |
 
 ## 源脚本协议（宿主已实现，脚本照旧写）
