@@ -4,6 +4,14 @@ import Foundation
 struct LyricLine: Hashable {
   var time: Double // 秒
   var text: String
+  /// 逐字词段（lxlyric 解析；nil = 无逐字数据）。start/dur 为相对行首的秒数
+  var words: [LyricWord]?
+}
+
+struct LyricWord: Hashable {
+  var text: String
+  var start: Double // 相对行首，秒
+  var dur: Double   // 秒
 }
 
 enum LrcParser {
@@ -31,6 +39,43 @@ enum LrcParser {
       text = text.trimmingCharacters(in: .whitespaces)
       guard !text.isEmpty else { continue }
       out.append(LyricLine(time: m * 60 + s + ms, text: text))
+    }
+    return out.sorted { $0.time < $1.time }
+  }
+
+  /// 解析逐字歌词（lxlyric）：`[mm:ss.mmm]<a,b>词<a,b,c>词`
+  /// a = 词起点毫秒（相对行首），b = 词时长毫秒；第三段（kg-KRC 占位）忽略。
+  /// 返回的行带 words，text 为拼接纯文本（无词数据的行不产出）。
+  static func parseWordSync(_ lxlyric: String) -> [LyricLine] {
+    let lineRxp = try! NSRegularExpression(pattern: #"\[(\d{1,3}):(\d{1,2})(?:[.:](\d{1,3}))?\]"#)
+    let wordRxp = try! NSRegularExpression(pattern: #"<(-?\d+),(-?\d+)(?:,-?\d+)?>"#)
+    var out: [LyricLine] = []
+    for raw in lxlyric.components(separatedBy: .newlines) {
+      let ns = raw as NSString
+      let lineMatches = lineRxp.matches(in: raw, range: NSRange(location: 0, length: ns.length))
+      guard let last = lineMatches.last else { continue }
+      func g(_ i: Int) -> String { last.range(at: i).location == NSNotFound ? "" : ns.substring(with: last.range(at: i)) }
+      let m = Double(g(1)) ?? 0, s = Double(g(2)) ?? 0
+      var frac = g(3)
+      while frac.count < 3 { frac += "0" }
+      let lineTime = m * 60 + s + (Double(frac.prefix(3)) ?? 0) / 1000
+
+      let wordMatches = wordRxp.matches(in: raw, range: NSRange(location: 0, length: ns.length))
+      guard !wordMatches.isEmpty else { continue }
+      var words: [LyricWord] = []
+      for (i, wm) in wordMatches.enumerated() {
+        let startMs = Double(ns.substring(with: wm.range(at: 1))) ?? 0
+        let durMs = Double(ns.substring(with: wm.range(at: 2))) ?? 0
+        let textStart = wm.range.upperBound
+        let textEnd = i + 1 < wordMatches.count ? wordMatches[i + 1].range.lowerBound : ns.length
+        guard textEnd >= textStart else { continue }
+        // 保留原始空白：短语间隔（空格词）参与逐字点亮节奏
+        let text = ns.substring(with: NSRange(location: textStart, length: textEnd - textStart))
+        guard !text.isEmpty, durMs > 0 else { continue }
+        words.append(LyricWord(text: text, start: startMs / 1000, dur: durMs / 1000))
+      }
+      guard !words.isEmpty else { continue }
+      out.append(LyricLine(time: lineTime, text: words.map(\.text).joined(), words: words))
     }
     return out.sorted { $0.time < $1.time }
   }

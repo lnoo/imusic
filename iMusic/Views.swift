@@ -39,7 +39,7 @@ struct EmptyStateView: View {
 }
 
 enum SideItem: Hashable {
-  case home, search, nowPlaying, history, downloads, source
+  case home, search, songlists, nowPlaying, history, downloads, source
   case playlist(String)
   case board(String)
 }
@@ -130,7 +130,13 @@ struct ContentView: View {
             .onSubmit {
               let kw = search.keyword
               sel = .search
-              Task { await search.searchAll(keyword: kw) }
+              Task {
+                if search.searchMode == .songlists {
+                  await search.searchSonglists(keyword: kw)
+                } else {
+                  await search.searchAll(keyword: kw)
+                }
+              }
             }
         }
         .padding(.horizontal, 10)
@@ -158,7 +164,8 @@ struct ContentView: View {
   @ViewBuilder private var detail: some View {
     switch sel {
     case .home: HomeView(sel: $sel)
-    case .search: SearchView()
+    case .search: SearchView(sel: $sel)
+    case .songlists: SonglistBrowseView()
     case .nowPlaying: NowPlayingView(sel: $sel)
     case .history: HistoryView()
     case .downloads: DownloadsView()
@@ -180,6 +187,7 @@ struct SidebarView: View {
         navLabel("发现")
         navRow(.home, title: "主页", icon: "house.fill")
         navRow(.search, title: "搜索", icon: "magnifyingglass")
+        navRow(.songlists, title: "歌单", icon: "square.grid.2x2")
         navRow(.nowPlaying, title: "正在播放", icon: "play.circle.fill")
         navRow(.source, title: "音源设置", icon: "dot.radiowaves.left.and.right")
 
@@ -860,22 +868,70 @@ struct CoverThumb: View {
   }
 }
 
-// MARK: - 搜索页 (SearchView)
+// MARK: - 搜索页 (SearchView)：单曲（多源聚合）/ 歌单（songlistSearch）两个 Tab
 struct SearchView: View {
   @Environment(SearchService.self) private var search
+  @Environment(SonglistStore.self) private var songlists
   @Environment(PlayerStore.self) private var player
   @Environment(LibraryStore.self) private var library
   @Environment(DownloadStore.self) private var downloads
+  @Binding var sel: SideItem
 
   var body: some View {
+    @Bindable var search = search
     // 每轮搜索发起（session+1）与结束（searching 翻回 false）都会变 → 驱动列表滚回顶部
     let scrollToken = search.searchSession * 2 + (search.searching ? 1 : 0)
     VStack(spacing: 0) {
+      modePicker
+        .padding(.horizontal, 24)
+        .padding(.top, 16)
+
+      switch search.searchMode {
+      case .songs: songsSection(scrollToken: scrollToken)
+      case .songlists: songlistsSection
+      }
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .background(Theme.bg)
+    .onChange(of: search.searchMode) { _, _ in
+      // 切 Tab 时若已有关键词立即按新模式补拉（单曲结果在提交时已就绪）
+      Task {
+        if search.searchMode == .songlists, !search.keyword.isEmpty, search.slResults.isEmpty {
+          await search.searchSonglists(keyword: search.keyword)
+        }
+      }
+    }
+  }
+
+  // MARK: 单曲 / 歌单 切换
+
+  private var modePicker: some View {
+    HStack {
+      Picker("搜索类型", selection: Binding(
+        get: { search.searchMode },
+        set: { new, _ in Task { await search.setSearchMode(new) } }
+      )) {
+        ForEach(SearchService.SearchMode.allCases, id: \.self) { m in
+          Text(m.rawValue).tag(m)
+        }
+      }
+      .pickerStyle(.segmented)
+      .labelsHidden()
+      .frame(width: 180)
+      .accessibilityLabel("搜索类型")
+      Spacer()
+    }
+  }
+
+  // MARK: 单曲结果（多源聚合）
+
+  private func songsSection(scrollToken: Int) -> some View {
+    Group {
       if search.results.isEmpty && !search.searching {
         EmptyStateView(
           title: search.keyword.isEmpty ? "搜索歌曲" : "未找到相关歌曲",
           systemImage: "magnifyingglass",
-          description: search.keyword.isEmpty ? "输入关键词开始搜索" : "尝试更换关键词"
+          description: search.keyword.isEmpty ? "输入关键词开始搜索" : "尝试更换关键词，或切到「歌单」搜索"
         )
       } else {
         VStack(alignment: .leading, spacing: 0) {
@@ -924,8 +980,96 @@ struct SearchView: View {
         }
       }
     }
-    .frame(maxWidth: .infinity, maxHeight: .infinity)
-    .background(Theme.bg)
+  }
+
+  // MARK: 歌单结果（来源 chips + 卡片网格，点击进歌单详情）
+
+  private var songlistsSection: some View {
+    Group {
+      if search.keyword.isEmpty {
+        EmptyStateView(
+          title: "搜索歌单",
+          systemImage: "square.grid.2x2",
+          description: "在顶部搜索框输入关键词"
+        )
+      } else if search.slSearching && search.slResults.isEmpty {
+        VStack {
+          Spacer()
+          ProgressView()
+          Spacer()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+      } else if search.slResults.isEmpty {
+        EmptyStateView(
+          title: search.slError ?? "未找到相关歌单",
+          systemImage: "square.grid.2x2",
+          description: search.slError == nil ? "换个来源或关键词试试" : "点击重试",
+          action: search.slError == nil ? nil : { Task { await search.searchSonglists(keyword: search.keyword) } }
+        )
+      } else {
+        VStack(alignment: .leading, spacing: 12) {
+          HStack {
+            Text("歌单结果")
+              .font(.title2.bold())
+              .foregroundStyle(.white)
+            Text("\(search.slResults.count) 个")
+              .font(.subheadline)
+              .foregroundStyle(Theme.text2)
+            Spacer()
+            sourceChips
+          }
+          .padding(.horizontal, 24)
+          .padding(.top, 20)
+
+          ScrollView {
+            SonglistGrid(items: search.slResults) { item in
+              openSonglist(item)
+            }
+            .padding(.horizontal, 24)
+            .padding(.bottom, 20)
+            .spotifyScrollbar()
+          }
+        }
+      }
+    }
+  }
+
+  /// 歌单搜索来源（kw/mg 无公开歌单接口，仅 wy/tx/kg）
+  private var sourceChips: some View {
+    HStack(spacing: 6) {
+      ForEach(SonglistStore.searchableSources, id: \.rawValue) { src in
+        let selected = search.slSourceId == src.rawValue
+        Button {
+          Task { await search.setSonglistSource(src.rawValue) }
+        } label: {
+          HStack(spacing: 4) {
+            if selected {
+              Image(systemName: "checkmark")
+                .font(.system(size: 9, weight: .bold))
+            }
+            Text(SourceRegistry.capability(id: src.rawValue)?.displayName ?? src.rawValue)
+          }
+          .font(Theme.caption(.semibold))
+          .foregroundStyle(selected ? Theme.accent : Theme.text2)
+          .padding(.horizontal, 10)
+          .padding(.vertical, 5)
+          .background(
+            RoundedRectangle(cornerRadius: Theme.radiusRow, style: .continuous)
+              .fill(selected ? Theme.navHover : Theme.card)
+          )
+        }
+        .buttonStyle(.plain)
+        .help("搜索\(SourceRegistry.capability(id: src.rawValue)?.displayName ?? src.rawValue)歌单")
+        .accessibilityLabel("来源：\(SourceRegistry.capability(id: src.rawValue)?.displayName ?? src.rawValue)")
+        .accessibilityAddTraits(selected ? .isSelected : [])
+      }
+    }
+  }
+
+  private func openSonglist(_ item: ALSongListItem) {
+    let source = search.slSourceId
+    sel = .songlists
+    Task { await songlists.open(item, fromSource: source) }
   }
 }
 
@@ -1020,12 +1164,18 @@ struct CoverBig: View {
   }
 }
 
-// MARK: - 歌词视图 (流体遮罩 + 弹性同步滚动)
+// MARK: - 歌词视图 (流体遮罩 + 弹性同步滚动；有 lxlyric 时当前行逐字点亮)
 struct LyricView: View {
   @Environment(PlayerStore.self) private var player
   @Environment(\.accessibilityReduceMotion) var reduceMotion
 
-  private var lines: [LyricLine] { player.lyric.map { LrcParser.parse($0.lyric) } ?? [] }
+  private var lines: [LyricLine] {
+    if let lx = player.lyric?.lxlyric, !lx.isEmpty {
+      let wordLines = LrcParser.parseWordSync(lx)
+      if !wordLines.isEmpty { return wordLines }
+    }
+    return player.lyric.map { LrcParser.parse($0.lyric) } ?? []
+  }
   private var idx: Int? { LrcParser.index(at: player.currentTime, in: lines) }
 
   var body: some View {
@@ -1046,10 +1196,7 @@ struct LyricView: View {
 
             ForEach(parsedLines.indices, id: \.self) { i in
               let isCurrent = (i == currentIdx)
-              Text(parsedLines[i].text)
-                .font(isCurrent ? .system(size: 24, weight: .bold) : .system(size: 16, weight: .medium))
-                .foregroundStyle(isCurrent ? Color.white : Theme.text2.opacity(0.55))
-                .scaleEffect(isCurrent ? 1.03 : 1.0, anchor: .leading)
+              lyricLine(parsedLines[i], isCurrent: isCurrent)
                 .id(i)
                 .animation(.spring(response: 0.35, dampingFraction: 0.85), value: currentIdx)
                 .onTapGesture {
@@ -1082,6 +1229,33 @@ struct LyricView: View {
       }
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity)
+  }
+
+  /// 行渲染：当前行且有词段 → 逐字点亮（已唱全亮、未唱半透明）；其余行纯文本
+  @ViewBuilder private func lyricLine(_ line: LyricLine, isCurrent: Bool) -> some View {
+    if isCurrent, let words = line.words, !words.isEmpty {
+      HStack(spacing: 0) {
+        let lineStart = line.time
+        ForEach(Array(words.enumerated()), id: \.offset) { _, word in
+          let wordTime = lineStart + word.start
+          let sung = player.currentTime >= wordTime
+          Text(word.text)
+            .font(.system(size: 24, weight: .bold))
+            .foregroundStyle(sung ? Color.white : Color.white.opacity(0.42))
+            .onTapGesture {
+              player.seek(wordTime / max(player.duration, 1.0))
+            }
+        }
+      }
+      .scaleEffect(1.03, anchor: .leading)
+      .accessibilityElement(children: .ignore)
+      .accessibilityLabel(line.text)
+    } else {
+      Text(line.text)
+        .font(isCurrent ? .system(size: 24, weight: .bold) : .system(size: 16, weight: .medium))
+        .foregroundStyle(isCurrent ? Color.white : Theme.text2.opacity(0.55))
+        .scaleEffect(isCurrent ? 1.03 : 1.0, anchor: .leading)
+    }
   }
 }
 

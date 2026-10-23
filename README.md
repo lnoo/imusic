@@ -28,10 +28,12 @@ iMusic/
   SourceScriptParser.swift# parseScriptInfo/matchInfo + gz_+base64（对标 main/modules/userApi/utils.ts）
   UserApiStore.swift      # 导入/删除/选择/持久化（对标 UserApiModal + store.ts）
   UserApiEngine.swift     # JS 沙箱 lx.*（对标 renderer/preload.js + main.ts；对标 any-listen lx-api-source-loader）
-  SearchService.swift     # 搜索+榜单聚合（读 SourceRegistry，不写死源）
+  SearchService.swift     # 搜索+榜单聚合（读 SourceRegistry，不写死源）+ 歌单搜索状态 + 动态榜单目录
   SourceRegistry.swift    # 源能力注册表（对标 any-listen ResourceAction 宿主侧；加新源只改此一处）
-  Boards.swift            # 主页榜单目录 + HomeBoardFetcher（→ topSongsDetail 解析层）
-  HomeView.swift          # 主页发现页（Hero/资料库总览/多源榜单/随心听/推荐，默认落地页）
+  Boards.swift            # 主页榜单目录（静态兜底）+ HomeBoardFetcher（→ topSongsDetail 解析层）
+  SonglistStore.swift     # 在线歌单浏览状态机：源/排序/标签 → 列表翻页 → 详情（wy/tx 浏览，kg 搜索）
+  SonglistView.swift      # 歌单页 + 歌单卡片网格 + 歌单详情（复用 SongRow/PlayAllButton）
+  HomeView.swift          # 主页发现页（随心听/动态多源榜单目录，默认落地页）
   AudioPulse.swift        # 随心听律动信号：AVAssetReader 旁路二次解码 + vDSP FFT 三频带 + 节拍检测（无音频落 104BPM 模拟律动）
   RandomListenMascot.swift# 随心听卡片视觉：Metal 律动 shader 背景 + 「流萤」2D 精灵宠物（播放小跑、随拍弹跳、切歌招手；素材见文件头致谢）
   Shaders.metal           # 卡片背景 fragment（渐变光斑 + 拍涟漪，随低/中/高频与响度律动，无噪声场）
@@ -53,6 +55,19 @@ demo-source.js            # 可直接导入联调的最小源脚本
 - **加密歌词**：kg-KRC（XOR+zlib）、tx-QRC（pyqdes 三重 DES+zlib）、kw-lrcx（zlib+base64+"yeelion" XOR）在 `LyricCodec` 解码，均输出 原文/翻译/逐字(lxlyric)。
 - **分工与 any-listen 生态一致**：app 内置直连解析负责 搜索/歌单/榜单/歌词/封面；播放直链主路径走 LX 自定义源脚本（= any-listen 的 lx-api-source-loader 定位），内置兜底走 `musicUrl`（kw 为官网 Secret 签名 playUrl，wy/tx 与 GD音乐台扩展同源接口）。
 - **实测**：五源「搜索/歌单/榜单/歌词/封面」逐项实网验证全绿（见 git log 对应提交）。
+
+## 界面能力（对标 any-listen 浏览体验）
+
+- **歌单页**（侧栏「发现 → 歌单」）：来源切换（网易云/QQ）、排序与分类筛选、歌单卡片网格（封面/播放量/曲数）、
+  详情就地切换（封面头图 + 播放全部 + 歌曲表）；搜索页「歌单」Tab 直达（wy/tx/kg 三源可切）。
+- **榜单动态目录**：主页榜单卡来自 `topSongs()` 接口目录（kg 56 张 / tx 30 张，带榜图），
+  静态目录作兜底；预取前 8 张，其余点进详情按需拉取；缓存 key 与旧版完全兼容。
+- **逐字歌词**：kw-lrcx / kg-KRC / tx-QRC 解码出的词级时间轴在「正在播放」按 `currentTime` 逐字点亮，
+  点任意词可跳播到该词起点；无逐字数据的源回退行级歌词。
+- **OpenAPI 查询路由**（默认 33030，query 均已 percentDecode）：
+  `/search?keyword=&source=`、`/songlist/search?keyword=&source=`、`/songlist/detail?source=&id=`、
+  `/board?source=`、`/board/detail?source=&id=`、`/lyric?source=&songmid=`（kg 可附 `hash`/`secs`），
+  返回 `{ok, list, info...}`；播放控制子集（/status /play /toggle…）保持原样。
 
 ## 加新源（注册表模式）
 

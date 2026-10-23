@@ -13,7 +13,11 @@ struct HomeView: View {
   }()
   @State private var boardTab: String = {
     let saved = UserDefaults.standard.string(forKey: "home.boardId") ?? ""
-    return HomeBoards.board(id: saved) != nil ? saved : HomeBoards.defaultBoardId
+    if HomeBoards.board(id: saved) != nil { return saved }
+    // 动态目录的榜（source__key）：源合法即接受，目录加载后 normalize 兜底
+    let parts = saved.split(separator: "__")
+    if parts.count == 2, HomeBoards.sources.contains(where: { $0.id == parts[0] }) { return saved }
+    return HomeBoards.defaultBoardId
   }()
   @State private var sourceMenuHovered = false
 
@@ -24,7 +28,7 @@ struct HomeView: View {
   }
 
   private var boards: [HomeBoard] {
-    HomeBoards.boards(for: sourceTab)
+    search.boards(for: sourceTab)
   }
 
   private var chartSongs: [MusicInfo] {
@@ -65,7 +69,7 @@ struct HomeView: View {
   }
 
   private var board: HomeBoard {
-    HomeBoards.board(id: boardTab) ?? HomeBoards.board(id: HomeBoards.defaultBoardId)!
+    search.board(id: boardTab) ?? HomeBoards.board(id: HomeBoards.defaultBoardId)!
   }
 
   // MARK: - 视图
@@ -84,6 +88,7 @@ struct HomeView: View {
     .background(Theme.bg)
     .task {
       if search.hot.isEmpty { await search.loadHot() }
+      await search.loadBoardCatalog(for: sourceTab)
       if !search.hasCharts(for: sourceTab) {
         // 缓存秒开：有效期内展示缓存 + 后台静默刷新；过期/无缓存则前台等待网络
         let fresh = search.restoreHomeChartsCache()
@@ -102,8 +107,12 @@ struct HomeView: View {
       UserDefaults.standard.set(new, forKey: "home.sourceId")
       normalizeBoardTab()
       UserDefaults.standard.set(boardTab, forKey: "home.boardId")
-      if !search.hasCharts(for: new) {
-        Task { await search.loadHomeCharts(for: new) }
+      Task {
+        await search.loadBoardCatalog(for: new)
+        normalizeBoardTab()
+        if !search.hasCharts(for: new) {
+          await search.loadHomeCharts(for: new)
+        }
       }
     }
     .onChange(of: boardTab) { _, new in
@@ -230,7 +239,7 @@ struct BoardDetailView: View {
   @State private var errorText: String?
   @State private var updatedAt: Date?
 
-  private var board: HomeBoard? { HomeBoards.board(id: boardId) }
+  private var board: HomeBoard? { search.board(id: boardId) }
 
   private var sourceName: String {
     guard let b = board else { return "" }
@@ -797,9 +806,11 @@ private struct HomeBoardCard: View {
               .font(Theme.body(.semibold))
               .foregroundStyle(Theme.text)
               .lineLimit(1)
-            Text(board.category)
-              .font(Theme.caption(.semibold))
-              .foregroundStyle(Theme.accent)
+            if !board.category.isEmpty {
+              Text(board.category)
+                .font(Theme.caption(.semibold))
+                .foregroundStyle(Theme.accent)
+            }
           }
 
           HStack(spacing: 12) {
@@ -864,7 +875,7 @@ private struct HomeBoardCard: View {
   }
 
   @ViewBuilder private var cover: some View {
-    if let url = songs.first?.picUrl {
+    if let url = board.pic ?? songs.first?.picUrl {
       CoverThumb(url: url, size: 76, cornerRadius: Theme.radiusCard)
     } else {
       RoundedRectangle(cornerRadius: Theme.radiusCard, style: .continuous)

@@ -2,17 +2,20 @@ import Foundation
 
 // MARK: - 主页榜单目录（源 -> 榜单两级展开的唯一真相源）
 //
-// 榜单目录保持不变（UI 同构）：id 形如 "kw__16"（source__榜单key），与主页缓存 key 同构。
-// key 的含义按源而定：kw=bangid，kg=rankid，tx=topid，wy=歌单id，mg=columnId。
-// 实际抓取统一走 any-listen 解析层（AnyListenResource.topSongsDetail → 各源实现）：
-//   kw kbangserver / kg rank/song / tx ToplistInfoServer / wy playlist detail / mg querycontentbyId
+// 目录双层：静态目录（本文件，含分类文案与默认选中）+ 动态目录（SearchService.boardCatalog，
+// 来自 any-listen topSongs 接口，带榜图，kg/tx 有数十张榜）。查询入口：
+//   SearchService.boards(for:)  动态优先，空/失败回退静态
+//   SearchService.board(id:)    同上（详情页用）
+// id 形如 "kw__16"（source__榜单key），与主页缓存 key 同构，动态目录完全兼容。
+// 实际抓取统一走 any-listen 解析层（AnyListenResource.topSongsDetail → 各源实现）。
 
 struct HomeBoard: Identifiable, Hashable, Sendable {
   var id: String { "\(sourceId)__\(key)" }
   var sourceId: String
   var key: String
   var name: String
-  var category: String // 推荐 / 飙升 / 新歌 / 风格 / 场景
+  var category: String // 推荐 / 飙升 / 新歌 / 风格 / 场景；动态目录未分类时为空
+  var pic: String? // 榜单封面（动态目录；静态目录 nil，卡片回退首歌封面）
 }
 
 enum HomeBoards {
@@ -64,6 +67,15 @@ enum HomeBoards {
 
   static func board(id: String) -> HomeBoard? {
     all.first { $0.id == id }
+  }
+
+  /// 动态目录条目 → HomeBoard：同名 key 继承静态分类，其余为未分类
+  static func dynamicBoard(sourceId: String, item: ALTopSongsItem) -> HomeBoard {
+    HomeBoard(
+      sourceId: sourceId, key: item.id, name: item.name,
+      category: all.first(where: { $0.sourceId == sourceId && $0.key == item.id })?.category ?? "",
+      pic: item.pic
+    )
   }
 }
 

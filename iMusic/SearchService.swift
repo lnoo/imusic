@@ -126,9 +126,41 @@ final class SearchService {
     chartsCacheFile.deletingLastPathComponent().appendingPathComponent("home_charts.json")
   }
 
+  // MARK: 榜单动态目录（any-listen topSongs 接口；带榜图；kg/tx 有数十张榜）
+  /// sourceId -> 动态目录；空/失败时 `boards(for:)` 回退 HomeBoards 静态目录
+  var boardCatalog: [String: [HomeBoard]] = [:]
+  var boardCatalogLoadingSource: String?
+  /// 主页一次预取的榜单数上限（目录可含数十榜，其余卡片点进详情再拉）
+  static let homeChartsPrefetchLimit = 8
+
+  /// 当前生效的榜单目录：动态优先，静态兜底
+  func boards(for sourceId: String) -> [HomeBoard] {
+    if let dyn = boardCatalog[sourceId], !dyn.isEmpty { return dyn }
+    return HomeBoards.boards(for: sourceId)
+  }
+
+  /// 按 id 查榜（动态 + 静态都查；详情页用）
+  func board(id: String) -> HomeBoard? {
+    let sourceId = id.split(separator: "__").first.map(String.init) ?? ""
+    if let b = boardCatalog[sourceId]?.first(where: { $0.id == id }) { return b }
+    return HomeBoards.board(id: id)
+  }
+
+  /// 拉取某源的动态榜单目录（成功后主页卡片带封面；失败静默回退静态目录）
+  func loadBoardCatalog(for sourceId: String) async {
+    guard boardCatalog[sourceId] == nil,
+          boardCatalogLoadingSource != sourceId,
+          let source = MusicSource(rawValue: sourceId), source != .local else { return }
+    boardCatalogLoadingSource = sourceId
+    defer { boardCatalogLoadingSource = nil }
+    let items = await AnyListenResource.topSongs(source: source)
+    guard !items.isEmpty else { return }
+    boardCatalog[sourceId] = items.map { HomeBoards.dynamicBoard(sourceId: sourceId, item: $0) }
+  }
+
   /// 该源是否有任何榜单数据（主页切源时决定是否触发网络拉取）
   func hasCharts(for sourceId: String) -> Bool {
-    HomeBoards.boards(for: sourceId).contains { !(homeCharts[$0.id]?.isEmpty ?? true) }
+    boards(for: sourceId).contains { !(homeCharts[$0.id]?.isEmpty ?? true) }
   }
 
   /// 同步恢复磁盘缓存（有就展示，保证冷启动秒开）。
@@ -174,7 +206,8 @@ final class SearchService {
   /// 拉取单个源的全部榜单（并发；单榜失败置空，不影响同源其他榜和其他源已有数据）
   func loadHomeCharts(for sourceId: String, limitPerBoard: Int = 10) async {
     guard !homeChartsLoading else { return }
-    let boards = HomeBoards.boards(for: sourceId)
+    // 动态目录可含数十张榜：主页只预取前 N 张，其余卡片点进详情再拉
+    let boards = Array(boards(for: sourceId).prefix(Self.homeChartsPrefetchLimit))
     guard !boards.isEmpty else { return }
     homeChartsLoading = true
     loadingSourceId = sourceId
@@ -208,6 +241,64 @@ final class SearchService {
   /// 全源聚合搜索（并发，单源失败不影响其他源；源来自注册表）
   func searchAll(keyword: String) async {
     await search(keyword: keyword)
+  }
+
+  // MARK: 歌单搜索（搜索页"歌单"Tab；对标 any-listen songlistSearch）
+  // kw/mg 无公开歌单接口（GD音乐台同源亦无），来源限定 wy/tx/kg。
+
+  enum SearchMode: String, CaseIterable {
+    case songs = "单曲"
+    case songlists = "歌单"
+  }
+
+  var searchMode: SearchMode = .songs
+  var slResults: [ALSongListItem] = []
+  var slSourceId = SonglistStore.searchableSources.first?.rawValue ?? "wy"
+  var slSearching = false
+  var slError: String?
+  private var slSession = 0
+
+  var slSourceName: String {
+    SourceRegistry.capability(id: slSourceId)?.displayName ?? slSourceId
+  }
+
+  /// 切换歌单搜索来源（已有关键词时立即重搜）
+  func setSonglistSource(_ id: String) async {
+    guard id != slSourceId,
+          SonglistStore.searchableSources.contains(where: { $0.rawValue == id }) else { return }
+    slSourceId = id
+    if !keyword.isEmpty {
+      await searchSonglists(keyword: keyword)
+    }
+  }
+
+  func searchSonglists(keyword: String) async {
+    let kw = keyword.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !kw.isEmpty else { return }
+    slSession += 1
+    let session = slSession
+    slSearching = true
+    slError = nil
+    defer { slSearching = false }
+    do {
+      let r = try await AnyListenResource.songlistSearch(
+        source: MusicSource(rawValue: slSourceId) ?? .wy, keyword: kw, page: 1, limit: 30)
+      guard session == slSession else { return }
+      slResults = r.list
+    } catch {
+      guard session == slSession else { return }
+      slResults = []
+      slError = error.localizedDescription
+    }
+  }
+
+  /// 切换搜索模式：进入"歌单"时若有关键词立即拉取
+  func setSearchMode(_ mode: SearchMode) async {
+    guard mode != searchMode else { return }
+    searchMode = mode
+    if mode == .songlists, !keyword.isEmpty, slResults.isEmpty {
+      await searchSonglists(keyword: keyword)
+    }
   }
 
   private func search(keyword: String) async {

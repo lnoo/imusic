@@ -12,6 +12,7 @@ final class AppState {
   let engine = UserApiEngine()
   let player = PlayerStore()
   let search = SearchService()
+  let songlists = SonglistStore()
   let library = LibraryStore.shared
   let downloads = DownloadStore.shared
   let openApi = OpenApiServer()
@@ -24,29 +25,135 @@ final class AppState {
     engine.onUpdateAlert = { [weak self] alert in
       Task { @MainActor in self?.api.updateAlert = alert }
     }
-    openApi.onCommand = { [weak self] path in
-      self?.handleOpenApi(path) ?? "{\"ok\":false}"
+    openApi.onCommand = { [weak self] path, params in
+      await self?.handleOpenApi(path, params: params) ?? "{\"ok\":false}"
     }
     openApi.start() // 默认启用 openAPI
     Task { await reloadSource() }
   }
 
-  /// openApi 动作映射（播放控制子集）
-  private func handleOpenApi(_ path: String) -> String {
-    func songJSON(_ s: MusicInfo?) -> String {
-      guard let s else { return "null" }
-      let d = try? JSONSerialization.data(withJSONObject: ["name": s.name, "singer": s.singer, "source": s.source.rawValue, "songmid": s.songmid])
-      return String(data: d ?? Data(), encoding: .utf8) ?? "null"
+  /// openApi 动作映射：播放控制子集 + any-listen 解析层查询路由
+  private func handleOpenApi(_ path: String, params: [String: String]) async -> String {
+    func songDict(_ s: MusicInfo) -> [String: Any] {
+      var d: [String: Any] = ["name": s.name, "singer": s.singer, "source": s.source.rawValue,
+                              "songmid": s.songmid, "albumName": s.albumName]
+      if let i = s.interval { d["interval"] = i }
+      if let p = s.picUrl { d["picUrl"] = p }
+      d["qualitys"] = s.qualitys.map { $0.type.rawValue }
+      return d
     }
+    func songsJSON(_ list: [MusicInfo]) -> String {
+      (list.map(songDict) as [Any]).jsonEncoded
+    }
+    func fail(_ msg: String) -> String {
+      ["ok": false, "error": msg].jsonEncoded
+    }
+    func intParam(_ key: String, _ fallback: Int) -> Int {
+      params[key].flatMap(Int.init) ?? fallback
+    }
+
     switch path {
     case "/status":
-      return "{\"ok\":true,\"playing\":\(player.isPlaying),\"mode\":\"\(player.mode.rawValue)\",\"progress\":\(player.progress),\"song\":\(songJSON(player.current))}"
+      let songPart = player.current.map { songDict($0).jsonEncoded } ?? "null"
+      return "{\"ok\":true,\"playing\":\(player.isPlaying),\"mode\":\"\(player.mode.rawValue)\",\"progress\":\(player.progress),\"song\":\(songPart)}"
     case "/play": player.togglePlay(true); return "{\"ok\":true}"
     case "/pause": player.togglePlay(false); return "{\"ok\":true}"
     case "/toggle": player.toggle(); return "{\"ok\":true}"
     case "/next": player.next(); return "{\"ok\":true}"
     case "/prev": player.prev(); return "{\"ok\":true}"
-    case "/lyric": return "{\"ok\":true,\"lyric\":\((player.lyric?.lyric ?? "").jsonEscaped)}"
+    case "/lyric":
+      // 无 source 参数：返回当前播放歌词（历史行为）
+      guard let srcRaw = params["source"], let source = MusicSource(rawValue: srcRaw), source != .local else {
+        return "{\"ok\":true,\"lyric\":\((player.lyric?.lyric ?? "").jsonEscaped)}"
+      }
+      // 按曲取词：kg 需 hash+secs（可缺省走名称兜底）
+      let song = MusicInfo(
+        name: params["name"] ?? "", singer: params["singer"] ?? "",
+        source: source, songmid: params["songmid"] ?? "",
+        albumName: params["album"] ?? "", interval: nil, qualitys: [],
+        picUrl: nil,
+        extra: ["hash": params["hash"] ?? "", "intervalSecs": params["secs"] ?? "",
+                "lrcUrl": params["lrcUrl"] ?? ""])
+      do {
+        let info = try await AnyListenResource.musicLyric(source: source, music: song)
+        return ["ok": true, "lyric": info.lyric, "tlyric": info.tlyric ?? "",
+                "rlyric": info.rlyric ?? "", "lxlyric": info.lxlyric ?? ""].jsonEncoded
+      } catch {
+        return fail(error.localizedDescription)
+      }
+    case "/search":
+      guard let srcRaw = params["source"], let source = MusicSource(rawValue: srcRaw), source != .local,
+            let keyword = params["keyword"], !keyword.isEmpty else {
+        return fail("需要 source 与 keyword 参数")
+      }
+      do {
+        let r = try await AnyListenResource.musicSearch(source: source, name: keyword,
+          page: intParam("page", 1), limit: min(intParam("limit", 20), 50))
+        return ["ok": true, "source": srcRaw, "total": r.total, "page": r.page, "limit": r.limit,
+                "list": r.list.map(songDict)].jsonEncoded
+      } catch {
+        return fail(error.localizedDescription)
+      }
+    case "/songlist/search":
+      guard let srcRaw = params["source"], let source = MusicSource(rawValue: srcRaw), source != .local,
+            let keyword = params["keyword"], !keyword.isEmpty else {
+        return fail("需要 source 与 keyword 参数")
+      }
+      do {
+        let r = try await AnyListenResource.songlistSearch(source: source, keyword: keyword,
+          page: intParam("page", 1), limit: min(intParam("limit", 20), 50))
+        return ["ok": true, "source": srcRaw, "total": r.total, "page": r.page, "limit": r.limit,
+                "list": r.list.map { s -> [String: Any] in
+                  var d: [String: Any] = ["id": s.id, "name": s.name]
+                  if let v = s.playCount { d["playCount"] = v }
+                  if let v = s.author { d["author"] = v }
+                  if let v = s.img { d["img"] = v }
+                  if let v = s.total { d["total"] = v }
+                  return d
+                }].jsonEncoded
+      } catch {
+        return fail(error.localizedDescription)
+      }
+    case "/songlist/detail":
+      guard let srcRaw = params["source"], let source = MusicSource(rawValue: srcRaw), source != .local,
+            let id = params["id"], !id.isEmpty else {
+        return fail("需要 source 与 id 参数")
+      }
+      do {
+        let r = try await AnyListenResource.songlistDetail(source: source, id: id,
+          page: intParam("page", 1), limit: min(intParam("limit", 30), 100))
+        var infoDict: [String: Any] = ["name": r.info.name]
+        if let v = r.info.img { infoDict["img"] = v }
+        if let v = r.info.desc { infoDict["desc"] = v }
+        if let v = r.info.author { infoDict["author"] = v }
+        if let v = r.info.playCount { infoDict["playCount"] = v }
+        return ["ok": true, "source": srcRaw, "id": id, "total": r.total,
+                "info": infoDict, "list": r.list.map(songDict)].jsonEncoded
+      } catch {
+        return fail(error.localizedDescription)
+      }
+    case "/board":
+      guard let srcRaw = params["source"], let source = MusicSource(rawValue: srcRaw), source != .local else {
+        return fail("需要 source 参数")
+      }
+      let boards = await AnyListenResource.topSongs(source: source)
+      return ["ok": true, "source": srcRaw,
+              "list": boards.map { ["id": $0.id, "name": $0.name, "pic": $0.pic ?? ""] }].jsonEncoded
+    case "/board/detail":
+      guard let srcRaw = params["source"], let source = MusicSource(rawValue: srcRaw), source != .local,
+            let id = params["id"], !id.isEmpty else {
+        return fail("需要 source 与 id 参数")
+      }
+      do {
+        let r = try await AnyListenResource.topSongsDetail(source: source, id: id,
+          page: intParam("page", 1), limit: min(intParam("limit", 50), 100))
+        return ["ok": true, "source": srcRaw, "id": id, "total": r.total,
+                "info": ["name": r.info.name, "pic": r.info.pic ?? "",
+                         "desc": r.info.desc ?? "", "date": r.info.date ?? ""],
+                "list": r.list.map(songDict)].jsonEncoded
+      } catch {
+        return fail(error.localizedDescription)
+      }
     default: return "{\"ok\":false,\"error\":\"unknown path\"}"
     }
   }
@@ -107,6 +214,7 @@ struct iMusicApp: App {
         .environment(state.engine)
         .environment(state.player)
         .environment(state.search)
+        .environment(state.songlists)
         .environment(state.library)
         .environment(state.downloads)
         .frame(minWidth: 980, minHeight: 640)
