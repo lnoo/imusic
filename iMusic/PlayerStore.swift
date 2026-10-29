@@ -110,6 +110,10 @@ final class PlayerStore {
   var qualityMap: [String: [MusicQuality]] = [:]
   /// 播放代次：连点上/下首时只认最后一次 resolve，防止旧任务后到覆盖
   private var playToken = 0
+  /// 因输出路由变化被自动暂停时，记录暂停前的输出设备 UID。
+  /// 默认输出切回该设备（如重新戴上耳机）且期间无任何手动播放/暂停操作时，自动续播一次。
+  /// 必须用 UID 而非 AudioDeviceID 匹配：蓝牙设备彻底断连（AirPods 入盒）后重连会被分配新 ID，UID 不变。
+  @ObservationIgnored private var pausedByRouteChangeDeviceUID: String?
 
   init() {
     configurePlayer()
@@ -309,6 +313,7 @@ final class PlayerStore {
     playbackState = .failed
     isPlaying = false
     resolvedUrl = nil
+    pausedByRouteChangeDeviceUID = nil
     status = message
     AudioPulse.shared.detach()
   }
@@ -376,6 +381,7 @@ final class PlayerStore {
     }
     playToken &+= 1
     let token = playToken
+    pausedByRouteChangeDeviceUID = nil // 手动切歌后不再自动续播
     if playerFailed || player.status == .failed { replacePlayer() }
     player.pause()
     installCurrentItem(nil)
@@ -390,17 +396,38 @@ final class PlayerStore {
     Task { await resolveAndPlay(song, token: token) }
   }
 
-  /// 默认输出设备断连/切走 → 暂停（已确认策略：不自动恢复，恢复须用户手动操作）
+  /// 默认输出设备断连/切走 → 暂停；之后默认输出切回暂停前设备（如重新戴上耳机）→ 自动续播。
+  /// 设备用 UID 而非 AudioDeviceID 匹配：AirPods 放回盒子彻底断连后重连，CoreAudio 会重新注册
+  /// 一个新的 AudioDeviceID，只有 UID（蓝牙按 MAC 派生）跨重连保持稳定。
+  /// 仅续播"因路由变化产生的暂停"：期间用户手动播放/暂停/切歌过则不再自动续播。
   private func outputRouteChanged() {
+    let previousID = OutputRouteMonitor.previousDeviceID
+    let newUID = OutputRouteMonitor.shared.activeDeviceUID
+    // 离开的设备：优先用变化前留存的 UID（断连场景旧 ID 已被销毁、按 ID 查不到 UID）
+    let previousUID = OutputRouteMonitor.previousDeviceUID ?? OutputRouteMonitor.uid(for: previousID)
+    if let pausedUID = pausedByRouteChangeDeviceUID, let newUID, newUID == pausedUID {
+      pausedByRouteChangeDeviceUID = nil
+      guard !isPlaying, playbackState == .ready, current != nil else { return }
+      rewindIfNeeded()
+      player.playImmediately(atRate: 1)
+      isPlaying = true
+      AudioPulse.shared.setPlaying(true)
+      status = "输出设备已恢复，继续播放"
+      return
+    }
+    // 同一物理设备重新注册（ID 变了、UID 未变）：不算路由变化，不打断播放
+    if let newUID, newUID == previousUID { return }
     guard isPlaying else { return }
-    let deviceRemoved = !OutputRouteMonitor.deviceStillConnected(OutputRouteMonitor.previousDeviceID)
+    pausedByRouteChangeDeviceUID = previousUID
+    let deviceRemoved = !OutputRouteMonitor.deviceStillConnected(previousID)
     player.pause()
     isPlaying = false
     AudioPulse.shared.setPlaying(false)
-    status = deviceRemoved ? "输出设备已断开，已暂停" : "输出设备已切换，已暂停"
+    status = deviceRemoved ? "输出设备已断开，已暂停（重新连接后自动续播）" : "输出设备已切换，已暂停（切回后自动续播）"
   }
 
   func togglePlay(_ on: Bool) {
+    pausedByRouteChangeDeviceUID = nil // 手动操作后不再自动续播
     if on {
       guard canTogglePlayback else { return }
       if playbackState == .failed, let current {
@@ -421,6 +448,7 @@ final class PlayerStore {
   }
 
   func toggle() {
+    pausedByRouteChangeDeviceUID = nil // 手动操作后不再自动续播
     if isPlaying {
       player.pause()
       isPlaying = false
@@ -475,6 +503,7 @@ final class PlayerStore {
       return
     }
     guard playbackState == .ready else { return }
+    pausedByRouteChangeDeviceUID = nil // 手动重播后不再自动续播
     player.seek(to: .zero)
     player.playImmediately(atRate: 1)
     progress = 0
@@ -665,16 +694,39 @@ final class PlayerStore {
 // 默认输出设备监听：设备断连或系统把默认输出切走（AirPods 摆下入盒、拔线、手动切源）时回调。
 // macOS 无公开的"摘下耳机"事件（iOS 的 AVAudioSession route 通知不可用），
 // 因此能覆盖的是设备断连/默认输出变化；摘下耳机但未断连（放桌上）收不到事件，属已知限制。
-// 已确认策略：断连/切走 → 暂停，不自动恢复。
+// 策略：断连/切走 → 暂停；之后默认输出切回暂停前的设备（如重新戴上耳机）→ 自动续播。
+// 设备身份用 UID（kAudioDevicePropertyDeviceUID）匹配：AudioDeviceID 不跨连接稳定，
+// AirPods 入盒彻底断连后重连会被 CoreAudio 重新注册为新 ID，蓝牙 UID（按 MAC 派生）则不变。
 @MainActor
 final class OutputRouteMonitor {
   static let shared = OutputRouteMonitor()
   /// 上一次的默认输出设备 ID（变化回调里取，用于区分"断开"与"切到另一设备"）
   private(set) static var previousDeviceID = AudioDeviceID(kAudioObjectUnknown)
+  /// 上一次的默认输出设备 UID（设备还存活时缓存，断连销毁后仍可按 UID 认出重连的同一副耳机）
+  private(set) static var previousDeviceUID: String?
 
   private var listenerBlock: AudioObjectPropertyListenerBlock?
-  private var activeDeviceID = AudioDeviceID(kAudioObjectUnknown)
+  /// 当前默认输出设备 ID（变化回调里取，用于判断是否切回了暂停前的设备）
+  private(set) var activeDeviceID = AudioDeviceID(kAudioObjectUnknown)
+  /// 当前默认输出设备 UID（同上，在设备存活期间缓存）
+  private(set) var activeDeviceUID: String?
   private var onChange: (() -> Void)?
+
+  /// 设备稳定标识：kAudioDevicePropertyDeviceUID。蓝牙设备按 MAC 地址派生，断连重连/重新注册不变。
+  static func uid(for id: AudioDeviceID) -> String? {
+    guard id != AudioDeviceID(kAudioObjectUnknown) else { return nil }
+    var address = AudioObjectPropertyAddress(
+      mSelector: kAudioDevicePropertyDeviceUID,
+      mScope: kAudioObjectPropertyScopeGlobal,
+      mElement: kAudioObjectPropertyElementMain
+    )
+    var uidRef: Unmanaged<CFString>?
+    var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+    let status = AudioObjectGetPropertyData(id, &address, 0, nil, &size, &uidRef)
+    guard status == noErr, let uid = uidRef?.takeRetainedValue() else { return nil }
+    let str = uid as String
+    return str.isEmpty ? nil : str
+  }
 
   private static var defaultOutputDeviceID: AudioDeviceID {
     var address = AudioObjectPropertyAddress(
@@ -712,6 +764,7 @@ final class OutputRouteMonitor {
     guard listenerBlock == nil else { return }
     self.onChange = onChange
     activeDeviceID = Self.defaultOutputDeviceID
+    activeDeviceUID = Self.uid(for: activeDeviceID)
     var address = AudioObjectPropertyAddress(
       mSelector: kAudioHardwarePropertyDefaultOutputDevice,
       mScope: kAudioObjectPropertyScopeGlobal,
@@ -728,7 +781,10 @@ final class OutputRouteMonitor {
     let newID = Self.defaultOutputDeviceID
     guard newID != activeDeviceID else { return }
     Self.previousDeviceID = activeDeviceID
+    // 先留存旧设备 UID（此刻可能已被销毁，取不到时靠上次存活期间的缓存）
+    Self.previousDeviceUID = activeDeviceUID
     activeDeviceID = newID
+    activeDeviceUID = Self.uid(for: newID)
     onChange?()
   }
 }

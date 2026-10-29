@@ -39,6 +39,7 @@ iMusic/
   Shaders.metal           # 卡片背景 fragment（渐变光斑 + 拍涟漪，随低/中/高频与响度律动，无噪声场）
   firefly_spritesheet.webp# 「流萤」精灵图集（8×9 行动作网格，CC BY-NC 4.0，作者 legeling)
   PlayerStore.swift       # 取URL/降级/AVPlayer（对标 core/music/online.ts + useInitUserApi）
+  MediaRemote.swift       # 系统远程控制接管：MPRemoteCommandCenter（耳机手势/媒体键）+ MPNowPlayingInfoCenter（控制中心显示）
   App.swift               # setUserApi 胶水（对标 core/apiSource.ts + useSettingSync）
   Views.swift             # 搜索/播放条/正在播放
   SourceSettingsView.swift# 设置-源管理 UI（对标 SettingBasic + UserApiModal + OnlineImportModal）
@@ -68,6 +69,31 @@ demo-source.js            # 可直接导入联调的最小源脚本
   `/search?keyword=&source=`、`/songlist/search?keyword=&source=`、`/songlist/detail?source=&id=`、
   `/board?source=`、`/board/detail?source=&id=`、`/lyric?source=&songmid=`（kg 可附 `hash`/`secs`），
   返回 `{ok, list, info...}`；播放控制子集（/status /play /toggle…）保持原样。
+
+## 耳机与媒体键控制（AirPods 等）
+
+耳机手势**不直接进 App**：AirPods 的双击/捏合先由「系统设置 → 蓝牙 → 该耳机」映射成
+上一首 / 下一首 / 播放暂停，macOS 再把它们作为 `MPRemoteCommand` 分发给"正在播放"的 App。
+`MediaRemote.swift` 注册 `MPRemoteCommandCenter` 接住命令并转发到 `PlayerStore`：
+
+| 手势/按键 | 系统命令 | 行为 |
+|---|---|---|
+| AirPods 单/双/三击（按耳机设置） | `playCommand` / `pauseCommand` / `togglePlayPauseCommand` | 播放 / 暂停 / 切换 |
+| 播放暂停键 F8、耳机播放暂停 | `togglePlayPauseCommand` | `PlayerStore.toggle()` |
+| 下一首 F9、耳机下一首 | `nextTrackCommand` | `PlayerStore.next()` |
+| 上一首 F7、耳机上一首 | `previousTrackCommand` | `PlayerStore.prev()` |
+| 控制中心/锁屏拖进度条 | `changePlaybackPositionCommand` | `PlayerStore.seek(_:)` |
+
+同时 `MPNowPlayingInfoCenter` 同步曲目/歌手/封面/进度/播放态：
+控制中心显示 iMusic 与当前歌曲（这一步也是系统把命令路由给 iMusic 的依据）。
+命令处理器按 handler 实际状态返回 `.success / .noSuchContent / .noActionableNowPlayingItem`，
+无歌可切时不吞命令，系统可回落给其他播放器。
+
+**手势配置入口**：系统设置 → 蓝牙 → AirPods（右侧 ⋯）→ 逐一设置左耳/右耳/单双三击动作。
+"左耳=上一首、右耳=下一首"在耳机侧完成，App 侧只负责响应命令。
+
+**做不到（系统层限制）**：入耳检测自动暂停（macOS 无公开摘下耳机事件，摘下后仅当输出设备
+真正断连/切走才由 `OutputRouteMonitor` 暂停）、通透/降噪切换、耳机电量读取。
 
 ## 加新源（注册表模式）
 

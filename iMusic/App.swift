@@ -20,6 +20,8 @@ final class AppState {
   init() {
     player.attach(engine: engine)
     player.searcher = search
+    // 耳机手势/媒体键/控制中心 → MPRemoteCommand → PlayerStore
+    MediaRemoteController.shared.attach(to: player)
     syncQualityMap()
     engine.loadProxy()
     engine.onUpdateAlert = { [weak self] alert in
