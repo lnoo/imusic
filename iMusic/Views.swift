@@ -38,6 +38,69 @@ struct EmptyStateView: View {
   }
 }
 
+// MARK: - 通用 Tab 栏（扁平深色 + 播放绿选中态，贴左对齐，全宽底边线）
+// 任何"单曲/歌单"式页内切换都可复用：传 (id, label) 列表 + 选中绑定 + 切换回调。
+struct TabPillBar<ID: Hashable>: View {
+  struct Item: Hashable {
+    let id: ID
+    let label: String
+  }
+  let items: [Item]
+  @Binding var selection: ID
+  var onSelect: (ID) -> Void = { _ in }
+
+  var body: some View {
+    VStack(spacing: 0) {
+      HStack(spacing: 0) {
+        ForEach(items, id: \.id) { item in
+          TabButton(
+            label: item.label,
+            selected: item.id == selection
+          ) {
+            selection = item.id
+            onSelect(item.id)
+          }
+          .padding(.trailing, 20)
+        }
+      }
+      .padding(.top, 8)
+      .padding(.bottom, 10)
+
+      Rectangle()
+        .fill(Theme.separator)
+        .frame(height: 1)
+    }
+    .accessibilityElement(children: .contain)
+  }
+
+  private struct TabButton: View {
+    let label: String
+    let selected: Bool
+    let action: () -> Void
+
+    var body: some View {
+      Button(action: action) {
+        Text(label)
+          .font(Theme.body(selected ? .bold : .semibold))
+          .foregroundStyle(selected ? Theme.text : Theme.text2)
+          .overlay(alignment: .bottom) {
+            if selected {
+              Capsule()
+                .fill(Theme.accent)
+                .frame(height: 2.5)
+                .offset(y: 7.5)
+            }
+          }
+          .contentShape(Rectangle())
+      }
+      .buttonStyle(.plain)
+      .help("切换到\(label)")
+      .accessibilityLabel(label)
+      .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+  }
+}
+
 enum SideItem: Hashable {
   case home, search, songlists, nowPlaying, history, downloads, source
   case playlist(String)
@@ -884,8 +947,9 @@ struct SearchView: View {
     let scrollToken = search.searchSession * 2 + (search.searching ? 1 : 0)
     VStack(spacing: 0) {
       modePicker
-        .padding(.horizontal, 24)
         .padding(.top, 16)
+        .padding(.bottom, 4)
+        .frame(maxWidth: .infinity, alignment: .leading)
 
       switch search.searchMode {
       case .songs: songsSection(scrollToken: scrollToken)
@@ -907,21 +971,14 @@ struct SearchView: View {
   // MARK: 单曲 / 歌单 切换
 
   private var modePicker: some View {
-    HStack {
-      Picker("搜索类型", selection: Binding(
+    TabPillBar(
+      items: SearchService.SearchMode.allCases.map { .init(id: $0, label: $0.rawValue) },
+      selection: Binding(
         get: { search.searchMode },
-        set: { new, _ in Task { await search.setSearchMode(new) } }
-      )) {
-        ForEach(SearchService.SearchMode.allCases, id: \.self) { m in
-          Text(m.rawValue).tag(m)
-        }
-      }
-      .pickerStyle(.segmented)
-      .labelsHidden()
-      .frame(width: 180)
-      .accessibilityLabel("搜索类型")
-      Spacer()
-    }
+        set: { new in Task { await search.setSearchMode(new) } }
+      )
+    )
+    .accessibilityLabel("搜索类型")
   }
 
   // MARK: 单曲结果（多源聚合）
