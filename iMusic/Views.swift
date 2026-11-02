@@ -1164,19 +1164,96 @@ struct CoverBig: View {
   }
 }
 
-// MARK: - 歌词视图 (流体遮罩 + 弹性同步滚动；有 lxlyric 时当前行逐字点亮)
+// MARK: - 逐字歌词流式布局（支持超长行自动换行；替代 HStack，避免逐字当前行挤压/截断）
+struct FlowLayout: Layout {
+  var spacing: CGFloat = 0
+
+  func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+    let maxWidth = proposal.width ?? .infinity
+    var width: CGFloat = 0, height: CGFloat = 0
+    var lineWidth: CGFloat = 0, lineHeight: CGFloat = 0
+    for sub in subviews {
+      let s = sub.sizeThatFits(.unspecified)
+      if lineWidth > 0, lineWidth + spacing + s.width > maxWidth {
+        height += lineHeight + spacing
+        lineWidth = s.width
+        lineHeight = s.height
+      } else {
+        lineWidth += (lineWidth == 0 ? 0 : spacing) + s.width
+        lineHeight = max(lineHeight, s.height)
+      }
+      width = max(width, lineWidth)
+    }
+    height += lineHeight
+    return CGSize(width: width, height: height)
+  }
+
+  func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+    let maxWidth = bounds.width
+    var x = bounds.minX, y = bounds.minY, lineHeight: CGFloat = 0
+    for sub in subviews {
+      let s = sub.sizeThatFits(.unspecified)
+      if x > bounds.minX, x + s.width > bounds.maxX {
+        x = bounds.minX
+        y += lineHeight + spacing
+        lineHeight = 0
+      }
+      sub.place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(s))
+      x += s.width + spacing
+      lineHeight = max(lineHeight, s.height)
+    }
+  }
+}
+
+// MARK: - 歌词视图 (流体遮罩 + 弹性同步滚动；有 lxlyric 时当前行逐字点亮；非中文歌词带源翻译)
 struct LyricView: View {
   @Environment(PlayerStore.self) private var player
   @Environment(\.accessibilityReduceMotion) var reduceMotion
+  /// 系统机翻兜底单例（观察其状态以自动刷新歌词/开关）
+  private let translator = LyricTranslator.shared
 
-  private var lines: [LyricLine] {
-    if let lx = player.lyric?.lxlyric, !lx.isEmpty {
+  /// 解析后的原文行（有 lxlyric 走逐字，否则走普通 LRC）
+  private var baseLines: [LyricLine] {
+    guard let info = player.lyric else { return [] }
+    if let lx = info.lxlyric, !lx.isEmpty {
       let wordLines = LrcParser.parseWordSync(lx)
       if !wordLines.isEmpty { return wordLines }
     }
-    return player.lyric.map { LrcParser.parse($0.lyric) } ?? []
+    return LrcParser.parse(info.lyric)
+  }
+
+  private var lines: [LyricLine] {
+    let base = baseLines
+    guard showTrans else { return base }
+    // 非中文歌词 + 翻译开关 → 优先源自带 tlyric，否则用系统机翻（any-listen line-player 同款时间戳对齐）
+    if hasSourceTlyric, let t = player.lyric?.tlyric, !t.isEmpty {
+      return LrcParser.mergeTranslation(base, t)
+    }
+    if let machine = translator.currentCached, !machine.isEmpty {
+      return LrcParser.mergeTranslation(base, machine)
+    }
+    return base
   }
   private var idx: Int? { LrcParser.index(at: player.currentTime, in: lines) }
+
+  /// 源是否自带翻译（wy/tx/kw/mg 的 tlyric；kg 无）
+  private var hasSourceTlyric: Bool {
+    let t = player.lyric?.tlyric ?? ""
+    return !t.isEmpty
+  }
+  /// 原文是否中文歌词（中文歌显示翻译没有意义）
+  private var isChineseOriginal: Bool {
+    guard let info = player.lyric else { return true }
+    return LrcParser.isChinese([info.lxlyric, info.lyric].compactMap { $0 }.joined())
+  }
+  /// 翻译当前是否生效（开关开 + 非中文 + 有来源翻译或机翻已可用）
+  private var showTrans: Bool {
+    player.showTranslation && !isChineseOriginal && (hasSourceTlyric || translator.available)
+  }
+  /// 翻译是否可能（非中文 + 有源翻译或机翻可用）——用于开关按钮显隐
+  private var translationPossible: Bool {
+    !isChineseOriginal && (hasSourceTlyric || translator.available)
+  }
 
   var body: some View {
     let parsedLines = lines
@@ -1221,40 +1298,91 @@ struct LyricView: View {
           endPoint: .bottom
         )
       }
+      .overlay(alignment: .topTrailing) {
+        if translationPossible {
+          translationToggle
+            .padding(.top, 8)
+            .padding(.trailing, 4)
+        }
+      }
       .onChange(of: currentIdx) { _, newIdx in
         guard let newIdx, !reduceMotion else { return }
         withAnimation(.spring(response: 0.45, dampingFraction: 0.9)) {
           proxy.scrollTo(newIdx, anchor: .center)
         }
       }
+      // 歌词/歌曲变化 → 无源翻译且非中文时触发系统机翻（幂等，完成后自动刷新）
+      .task(id: player.current?.id ?? "") {
+        let songID = player.current?.id ?? ""
+        guard !songID.isEmpty else { return }
+        await translator.ensureTranslation(songID: songID, base: baseLines, hasSourceTlyric: hasSourceTlyric)
+      }
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity)
   }
 
-  /// 行渲染：当前行且有词段 → 逐字点亮（已唱全亮、未唱半透明）；其余行纯文本
+  /// 翻译开关（仅翻译可能时出现；状态持久化 lyric.showTranslation；机翻进行中显示进度）
+  private var translationToggle: some View {
+    Button {
+      player.showTranslation.toggle()
+    } label: {
+      Group {
+        if translator.isTranslating && !hasSourceTlyric {
+          ProgressView()
+            .controlSize(.mini)
+        } else {
+          Image(systemName: "translate")
+            .font(.system(size: 11, weight: .semibold))
+        }
+      }
+      .foregroundStyle(player.showTranslation ? Theme.accent : Theme.text2.opacity(0.45))
+      .frame(width: 24, height: 24)
+      .background(Circle().fill(Theme.card.opacity(0.9)))
+    }
+    .buttonStyle(.plain)
+    .help(player.showTranslation ? "隐藏中文翻译" : "显示中文翻译")
+    .accessibilityLabel(player.showTranslation ? "隐藏中文翻译" : "显示中文翻译")
+  }
+
+  /// 行渲染：当前行且有词段 → 逐字点亮（已唱全亮、未唱半透明）；其余行纯文本；翻译小字随行。
+  /// 当前行逐字用 FlowLayout（超长行自动换行，避免 HStack 挤压/截断）
   @ViewBuilder private func lyricLine(_ line: LyricLine, isCurrent: Bool) -> some View {
     if isCurrent, let words = line.words, !words.isEmpty {
-      HStack(spacing: 0) {
-        let lineStart = line.time
-        ForEach(Array(words.enumerated()), id: \.offset) { _, word in
-          let wordTime = lineStart + word.start
-          let sung = player.currentTime >= wordTime
-          Text(word.text)
-            .font(.system(size: 24, weight: .bold))
-            .foregroundStyle(sung ? Color.white : Color.white.opacity(0.42))
-            .onTapGesture {
-              player.seek(wordTime / max(player.duration, 1.0))
-            }
+      VStack(alignment: .leading, spacing: 5) {
+        FlowLayout(spacing: 0) {
+          let lineStart = line.time
+          ForEach(Array(words.enumerated()), id: \.offset) { _, word in
+            let wordTime = lineStart + word.start
+            let sung = player.currentTime >= wordTime
+            Text(word.text)
+              .font(.system(size: 24, weight: .bold))
+              .foregroundStyle(sung ? Color.white : Color.white.opacity(0.42))
+              .onTapGesture {
+                player.seek(wordTime / max(player.duration, 1.0))
+              }
+          }
+        }
+        if let trans = line.translation, !trans.isEmpty {
+          Text(trans)
+            .font(.system(size: 14, weight: .semibold))
+            .foregroundStyle(Color.white.opacity(0.7))
         }
       }
       .scaleEffect(1.03, anchor: .leading)
       .accessibilityElement(children: .ignore)
-      .accessibilityLabel(line.text)
+      .accessibilityLabel(line.translation.map { "\(line.text)，\($0)" } ?? line.text)
     } else {
-      Text(line.text)
-        .font(isCurrent ? .system(size: 24, weight: .bold) : .system(size: 16, weight: .medium))
-        .foregroundStyle(isCurrent ? Color.white : Theme.text2.opacity(0.55))
-        .scaleEffect(isCurrent ? 1.03 : 1.0, anchor: .leading)
+      VStack(alignment: .leading, spacing: 4) {
+        Text(line.text)
+          .font(isCurrent ? .system(size: 24, weight: .bold) : .system(size: 16, weight: .medium))
+          .foregroundStyle(isCurrent ? Color.white : Theme.text2.opacity(0.55))
+        if let trans = line.translation, !trans.isEmpty {
+          Text(trans)
+            .font(isCurrent ? .system(size: 14, weight: .semibold) : .system(size: 13, weight: .medium))
+            .foregroundStyle(isCurrent ? Color.white.opacity(0.7) : Theme.text2.opacity(0.38))
+        }
+      }
+      .scaleEffect(isCurrent ? 1.03 : 1.0, anchor: .leading)
     }
   }
 }

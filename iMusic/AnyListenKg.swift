@@ -29,11 +29,11 @@ enum AnyListenKg {
     var out: [MusicInfo] = []
     var seen = Set<String>()
     for item in lists {
-      let key = ALHttp.str(item["Audioid"]) + ALHttp.str(item["FileHash"])
+      let key = ALHttp.str(item["Audioid"])
       guard seen.insert(key).inserted, let m = mapSearchItem(item) else { continue }
       out.append(m)
       for child in item["Grp"] as? [[String: Any]] ?? [] {
-        let ck = ALHttp.str(child["Audioid"]) + ALHttp.str(child["FileHash"])
+        let ck = ALHttp.str(child["Audioid"])
         guard seen.insert(ck).inserted, let cm = mapSearchItem(child) else { continue }
         out.append(cm)
       }

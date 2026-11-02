@@ -12,6 +12,12 @@ import Observation
 //   让控制中心显示 iMusic 与当前歌曲——这也是系统把命令路由给 iMusic 的依据。
 // 并发：handler 可能在任意线程到达，统一经 run(_:_:) hop 到 MainActor（isMainThread 快路径
 //   + 否则 main.sync），避免 Swift 6 严格并发下跨线程访问 @MainActor PlayerStore。
+//
+// ⚠ 隔离陷阱（曾致播放即崩，勿回退）：闭包若在 @MainActor 方法里"字面形成"且形参类型未标注隔离，
+//   类型检查放行但会被隐式推断成 @MainActor 隔离；MediaPlayer 随后在 */accessQueue 后台队列
+//   调它（artwork 取图）→ _swift_task_checkIsolatedSwift 断言 → SIGTRAP。
+//   因此所有"交给系统、可能在非主线程回调"的闭包（artwork handler / addTarget 回调）
+//   必须经下方 nonisolated 工厂形成，让闭包成为非隔离闭包。
 @MainActor
 final class MediaRemoteController {
   static let shared = MediaRemoteController()
@@ -37,11 +43,7 @@ final class MediaRemoteController {
     func reg(_ command: MPRemoteCommand, _ name: String,
              _ work: @escaping @MainActor () -> MPRemoteCommandHandlerStatus) {
       command.isEnabled = true
-      let token = command.addTarget { [weak self] _ -> MPRemoteCommandHandlerStatus in
-        guard let self else { return .commandFailed }
-        return self.run(name, work)
-      }
-      targets.append((command, token))
+      targets.append((command, command.addTarget(handler: makeHandler(name, work))))
     }
 
     reg(center.playCommand, "play") { [weak self] in self?.play() ?? .commandFailed }
@@ -50,23 +52,44 @@ final class MediaRemoteController {
     reg(center.togglePlayPauseCommand, "toggle") { [weak self] in self?.toggle() ?? .commandFailed }
     reg(center.nextTrackCommand, "next") { [weak self] in self?.next() ?? .commandFailed }
     reg(center.previousTrackCommand, "prev") { [weak self] in self?.prev() ?? .commandFailed }
-    // 控制中心拖动进度条 / 锁屏进度条
-    let seekToken = center.changePlaybackPositionCommand.addTarget { [weak self] event -> MPRemoteCommandHandlerStatus in
-      guard let self else { return .commandFailed }
-      return self.run("seek") { [weak self] in
-        MainActor.assumeIsolated {
-          guard let self, let player = self.player,
-                let event = event as? MPChangePlaybackPositionCommandEvent else { return .commandFailed }
-          guard player.canSeek, player.duration.isFinite, player.duration > 0 else { return .noSuchContent }
-          player.seek(event.positionTime / player.duration)
-          return .success
-        }
-      }
-    }
-    targets.append((center.changePlaybackPositionCommand, seekToken))
+    // 控制中心拖动进度条 / 锁屏进度条（positionTime 在非隔离上下文取出，跨隔离只传 Double）
+    targets.append((center.changePlaybackPositionCommand,
+                    center.changePlaybackPositionCommand.addTarget(handler: makeSeekHandler())))
 
     armObservation()
     pushNowPlaying()
+  }
+
+  // MARK: 非隔离闭包工厂（见文件头「隔离陷阱」：这些闭包必须在 nonisolated 上下文形成）
+
+  /// 系统命令回调：非隔离闭包，内部经 run(_:_:) hop 回主线程执行 work（work 为 @MainActor）。
+  nonisolated private func makeHandler(_ name: String,
+                                      _ work: @escaping @MainActor () -> MPRemoteCommandHandlerStatus)
+    -> (MPRemoteCommandEvent) -> MPRemoteCommandHandlerStatus {
+    return { [weak self] _ in
+      guard let self else { return .commandFailed }
+      return self.run(name, work)
+    }
+  }
+
+  /// seek 回调：先把 positionTime（Double）取出，再 hop 进主线程 seek。
+  nonisolated private func makeSeekHandler()
+    -> (MPRemoteCommandEvent) -> MPRemoteCommandHandlerStatus {
+    return { [weak self] event in
+      guard let self,
+            let position = (event as? MPChangePlaybackPositionCommandEvent)?.positionTime else { return .commandFailed }
+      return self.run("seek") { [weak self] in
+        guard let self, let player = self.player else { return .commandFailed }
+        guard player.canSeek, player.duration.isFinite, player.duration > 0 else { return .noSuchContent }
+        player.seek(position / player.duration)
+        return .success
+      }
+    }
+  }
+
+  /// artwork 取图闭包：MediaPlayer 会在 */accessQueue 后台队列调用，必须非隔离。
+  nonisolated private static func makeArtwork(_ image: NSImage) -> MPMediaItemArtwork {
+    MPMediaItemArtwork(boundsSize: image.size) { _ in image }
   }
 
   /// 移除全部命令并清空"正在播放"信息
@@ -160,7 +183,7 @@ final class MediaRemoteController {
       info[MPMediaItemPropertyPlaybackDuration] = player.duration
     }
     if let image = coverImage, image.size.width > 0, image.size.height > 0 {
-      info[MPMediaItemPropertyArtwork] = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
+      info[MPMediaItemPropertyArtwork] = Self.makeArtwork(image)
     }
     center.nowPlayingInfo = info
     center.playbackState = player.isPlaying ? .playing : .paused

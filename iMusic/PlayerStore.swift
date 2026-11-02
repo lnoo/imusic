@@ -23,6 +23,10 @@ final class PlayerStore {
   var duration: Double = 0 // 总秒数
   var mode: PlayMode = .sequence // 播放模式（对标 store/player）
   var volume: Double = 1.0 // 0...1
+  /// 歌词页显示中文翻译（仅非中文歌词且源提供 tlyric 时生效；any-listen player.isShowLyricTranslation 同位）
+  var showTranslation: Bool = UserDefaults.standard.object(forKey: "lyric.showTranslation") as? Bool ?? true {
+    didSet { UserDefaults.standard.set(showTranslation, forKey: "lyric.showTranslation") }
+  }
 
   enum PlaybackState: Equatable {
     case idle

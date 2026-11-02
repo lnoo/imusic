@@ -6,6 +6,8 @@ struct LyricLine: Hashable {
   var text: String
   /// 逐字词段（lxlyric 解析；nil = 无逐字数据）。start/dur 为相对行首的秒数
   var words: [LyricWord]?
+  /// 中文翻译（源自带 tlyric 按时间戳对齐；nil = 无翻译）
+  var translation: String?
 }
 
 struct LyricWord: Hashable {
@@ -16,29 +18,37 @@ struct LyricWord: Hashable {
 
 enum LrcParser {
   /// 解析 [mm:ss.xx] 行；去逐字标签 <a,b> / <a,b,c>（含负数档位，kg-KRC/kw-lrcx 逐字）/
-  /// (a,b)（QRC 词对）；去空行；按时间排序
+  /// (a,b)（QRC 词对）；去空行；按时间排序。
+  /// 一行多时间戳（[00:10][00:45]副歌）在每个时间点各产出一条（与翻译行对齐的前提）
   static func parse(_ lrc: String) -> [LyricLine] {
     let rxp = try! NSRegularExpression(pattern: #"\[(\d{1,3}):(\d{1,2})(?:[.:](\d{1,3}))?\]"#)
     var out: [LyricLine] = []
     for raw in lrc.components(separatedBy: .newlines) {
       let line = raw as NSString
       let matches = rxp.matches(in: raw, range: NSRange(location: 0, length: line.length))
-      guard let last = matches.last else { continue }
-      func g(_ i: Int) -> String { last.range(at: i).location == NSNotFound ? "" : line.substring(with: last.range(at: i)) }
-      let m = Double(g(1)) ?? 0, s = Double(g(2)) ?? 0
-      var frac = g(3)
-      let ms: Double
-      if frac.isEmpty { ms = 0 }
-      else {
-        while frac.count < 3 { frac += "0" }
-        ms = (Double(String(frac.prefix(3))) ?? 0) / 1000
+      guard !matches.isEmpty else { continue }
+      func g(_ m: NSTextCheckingResult, _ i: Int) -> String {
+        m.range(at: i).location == NSNotFound ? "" : line.substring(with: m.range(at: i))
+      }
+      func seconds(_ m: NSTextCheckingResult) -> Double {
+        let mm = Double(g(m, 1)) ?? 0, ss = Double(g(m, 2)) ?? 0
+        var frac = g(m, 3)
+        let ms: Double
+        if frac.isEmpty { ms = 0 }
+        else {
+          while frac.count < 3 { frac += "0" }
+          ms = (Double(String(frac.prefix(3))) ?? 0) / 1000
+        }
+        return mm * 60 + ss + ms
       }
       var text = rxp.stringByReplacingMatches(in: raw, range: NSRange(location: 0, length: line.length), withTemplate: "")
       text = text.replacingOccurrences(of: #"<-?\d+,\d+(,\d+)?>"#, with: "", options: .regularExpression)
       text = text.replacingOccurrences(of: #"\(\d+,\d+(,\d+)?\)"#, with: "", options: .regularExpression)
       text = text.trimmingCharacters(in: .whitespaces)
       guard !text.isEmpty else { continue }
-      out.append(LyricLine(time: m * 60 + s + ms, text: text))
+      for m in matches {
+        out.append(LyricLine(time: seconds(m), text: text))
+      }
     }
     return out.sorted { $0.time < $1.time }
   }
@@ -78,6 +88,55 @@ enum LrcParser {
       out.append(LyricLine(time: lineTime, text: words.map(\.text).joined(), words: words))
     }
     return out.sorted { $0.time < $1.time }
+  }
+
+  /// 翻译合并（对标 any-listen lyric-font-player/line-player.js：tlyric 按时间戳对齐挂到原文行）。
+  /// 排序双指针就近吸附，容差 200ms；一条翻译只消费一次，译文与原文相同（中文歌源直接回传原文）则跳过
+  static func mergeTranslation(_ lines: [LyricLine], _ tlyric: String) -> [LyricLine] {
+    let trans = parse(tlyric)
+    guard !trans.isEmpty, !lines.isEmpty else { return lines }
+    var out = lines
+    var j = 0
+    for i in out.indices {
+      while j + 1 < trans.count,
+            abs(trans[j + 1].time - out[i].time) <= abs(trans[j].time - out[i].time) {
+        j += 1
+      }
+      if abs(trans[j].time - out[i].time) <= 0.2,
+         out[i].translation == nil, trans[j].text != out[i].text {
+        out[i].translation = trans[j].text
+      }
+      // 该翻译行已消费或已落后于当前原文行（不可能再匹配更晚的行）
+      if trans[j].time <= out[i].time + 0.2 {
+        j += 1
+        if j >= trans.count { break }
+      }
+    }
+    return out
+  }
+
+  /// 原文语言粗判：是否中文歌词（决定是否需要显示翻译）。
+  /// 含假名/谚文 → 日/韩语，非中文；否则按汉字占字母类字符比例 ≥ 40% 视为中文
+  ///（纯符号/无字母按中文处理，不显示翻译）
+  static func isChinese(_ text: String) -> Bool {
+    var han = 0, letters = 0
+    var hasKanaOrHangul = false
+    scalarLoop: for scalar in text.unicodeScalars {
+      switch scalar.value {
+      case 0x3040...0x30FF, 0x31F0...0x31FF, // 平假名/片假名及其扩展
+           0xAC00...0xD7AF, 0x1100...0x11FF: // 谚文及其字母
+        hasKanaOrHangul = true
+        break scalarLoop
+      case 0x3400...0x4DBF, 0x4E00...0x9FFF, 0xF900...0xFAFF: // 汉字（扩展A/基本/兼容）
+        han += 1
+        letters += 1
+      default:
+        if scalar.properties.isAlphabetic { letters += 1 }
+      }
+    }
+    if hasKanaOrHangul { return false }
+    guard letters > 0 else { return true }
+    return Double(han) / Double(letters) >= 0.4
   }
 
   static func index(at seconds: Double, in lines: [LyricLine]) -> Int? {
