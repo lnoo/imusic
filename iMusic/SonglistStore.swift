@@ -24,9 +24,9 @@ final class SonglistStore {
   /// 会话号：换源/换标签/换排序 +1，丢弃过期响应
   var browseSession = 0
 
-  // MARK: 详情态（页内就地切换）
-  var openedList: ALSongListItem?
-  var openedSourceId = ""
+  // MARK: 详情态（作为顶层导航的一级，见 SideItem.songlistDetail）
+  var detailItem: ALSongListItem?
+  var detailSourceId = ""
   var detailSongs: [MusicInfo] = []
   var detailInfo: ALSongListDetailInfo?
   var detailTotal = 0
@@ -45,8 +45,8 @@ final class SonglistStore {
     SourceRegistry.capability(id: sourceId)?.displayName ?? sourceId
   }
 
-  var openedSourceName: String {
-    SourceRegistry.capability(id: openedSourceId)?.displayName ?? openedSourceId
+  var detailSourceName: String {
+    SourceRegistry.capability(id: detailSourceId)?.displayName ?? detailSourceId
   }
 
   private var browseKey: String { "\(sourceId)|\(selectedSortId)|\(selectedTagId)" }
@@ -136,12 +136,14 @@ final class SonglistStore {
     }
   }
 
-  /// 打开歌单详情（搜索页可跨源打开：fromSource 指定来源）
-  func open(_ item: ALSongListItem, fromSource sid: String? = nil) async {
-    let srcRaw = sid ?? sourceId
-    guard let source = MusicSource(rawValue: srcRaw), source != .local else { return }
-    openedList = item
-    openedSourceId = srcRaw
+  /// 加载歌单详情（搜索页可跨源打开：fromSource 指定来源）。幂等：同一 item+source 不重复加载。
+  func loadDetail(_ item: ALSongListItem, fromSource sid: String) async {
+    guard let source = MusicSource(rawValue: sid), source != .local else { return }
+    if detailItem == item, detailSourceId == sid, !detailLoading, detailError == nil, !detailSongs.isEmpty {
+      return
+    }
+    detailItem = item
+    detailSourceId = sid
     detailSongs = []
     detailInfo = nil
     detailTotal = 0
@@ -156,14 +158,5 @@ final class SonglistStore {
     } catch {
       detailError = error.localizedDescription
     }
-  }
-
-  func closeDetail() {
-    openedList = nil
-    openedSourceId = ""
-    detailSongs = []
-    detailInfo = nil
-    detailTotal = 0
-    detailError = nil
   }
 }

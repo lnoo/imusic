@@ -6,13 +6,10 @@ import SwiftUI
 struct SonglistBrowseView: View {
   @Environment(SonglistStore.self) private var store
   @Environment(PlayerStore.self) private var player
+  @Binding var sel: SideItem
 
   var body: some View {
-    if store.openedList != nil {
-      SonglistDetailView()
-    } else {
-      browse
-    }
+    browse
   }
 
   private var browse: some View {
@@ -202,7 +199,7 @@ struct SonglistBrowseView: View {
       )
     } else {
       SonglistGrid(items: store.lists) { item in
-        Task { await store.open(item) }
+        sel = .songlistDetail(item, source: store.sourceId)
       }
       .padding(.vertical, 2)
 
@@ -302,43 +299,30 @@ struct SonglistCard: View {
   }
 }
 
-// MARK: - 歌单详情（页内就地切换；对标榜单详情页：头图 + 播放全部 + 歌曲表）
+// MARK: - 歌单详情（作为顶层导航的一级；对标榜单详情页：头图 + 播放全部 + 歌曲表）
 
 struct SonglistDetailView: View {
   @Environment(SonglistStore.self) private var store
   @Environment(PlayerStore.self) private var player
+  let item: ALSongListItem
+  let source: String
 
   private var songs: [MusicInfo] { store.detailSongs }
 
   var body: some View {
     ScrollView {
       LazyVStack(alignment: .leading, spacing: 14) {
-        backRow
-        if let item = store.openedList {
-          detailHeader(item)
-          actionBar
-          columnHeader
-          listBody
-        }
+        detailHeader(item)
+        actionBar
+        columnHeader
+        listBody
       }
       .padding(Theme.spaceLG)
       .spotifyScrollbar()
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity)
     .background(Theme.bg)
-  }
-
-  private var backRow: some View {
-    Button {
-      store.closeDetail()
-    } label: {
-      Label("返回歌单", systemImage: "chevron.left")
-        .font(Theme.body(.medium))
-        .foregroundStyle(Theme.text2)
-    }
-    .buttonStyle(.plain)
-    .help("返回歌单列表")
-    .accessibilityLabel("返回歌单列表")
+    .task(id: item.id) { await store.loadDetail(item, fromSource: source) }
   }
 
   private func detailHeader(_ item: ALSongListItem) -> some View {
@@ -369,7 +353,7 @@ struct SonglistDetailView: View {
   }
 
   private func headerMeta(_ item: ALSongListItem) -> String {
-    var parts = [store.openedSourceName]
+    var parts = [store.detailSourceName]
     if let c = item.playCount, !c.isEmpty { parts.append("播放 \(c)") }
     if let a = item.author, !a.isEmpty { parts.append(a) }
     parts.append(store.detailTotal > 0 ? "共 \(store.detailTotal) 首" : "共 \(songs.count) 首")

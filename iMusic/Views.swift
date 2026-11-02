@@ -42,6 +42,7 @@ enum SideItem: Hashable {
   case home, search, songlists, nowPlaying, history, downloads, source
   case playlist(String)
   case board(String)
+  case songlistDetail(ALSongListItem, source: String)
 }
 
 // MARK: - 主框架 (ContentView)：侧栏 + 内容 + 全宽播放条
@@ -165,7 +166,8 @@ struct ContentView: View {
     switch sel {
     case .home: HomeView(sel: $sel)
     case .search: SearchView(sel: $sel)
-    case .songlists: SonglistBrowseView()
+    case .songlists: SonglistBrowseView(sel: $sel)
+    case .songlistDetail(let item, let source): SonglistDetailView(item: item, source: source)
     case .nowPlaying: NowPlayingView(sel: $sel)
     case .history: HistoryView()
     case .downloads: DownloadsView()
@@ -871,7 +873,6 @@ struct CoverThumb: View {
 // MARK: - 搜索页 (SearchView)：单曲（多源聚合）/ 歌单（songlistSearch）两个 Tab
 struct SearchView: View {
   @Environment(SearchService.self) private var search
-  @Environment(SonglistStore.self) private var songlists
   @Environment(PlayerStore.self) private var player
   @Environment(LibraryStore.self) private var library
   @Environment(DownloadStore.self) private var downloads
@@ -1068,8 +1069,7 @@ struct SearchView: View {
 
   private func openSonglist(_ item: ALSongListItem) {
     let source = search.slSourceId
-    sel = .songlists
-    Task { await songlists.open(item, fromSource: source) }
+    sel = .songlistDetail(item, source: source)
   }
 }
 
