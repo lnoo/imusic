@@ -192,6 +192,7 @@ struct ContentView: View {
           TextField("搜索歌曲、歌手、专辑", text: $search.keyword)
             .frame(width: 220)
             .onSubmit {
+              search.clearSuggestions()
               let kw = search.keyword
               sel = .search
               Task {
@@ -202,6 +203,14 @@ struct ContentView: View {
                 }
               }
             }
+          // 输入触发 mg 搜索提示（250ms 防抖）
+          .onChange(of: search.keyword) { _, kw in
+            if kw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+              search.clearSuggestions()
+            } else {
+              search.suggest(kw)
+            }
+          }
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 5)
@@ -209,6 +218,20 @@ struct ContentView: View {
           RoundedRectangle(cornerRadius: Theme.radiusCard, style: .continuous)
             .fill(Theme.field)
         )
+        // 搜索建议下拉（mg tipSearch）
+        .overlay(alignment: .topLeading) {
+          if search.showSuggestions, !search.suggestions.isEmpty {
+            SuggestionsDropdown(items: search.suggestions) { word in
+              search.clearSuggestions()
+              search.keyword = word
+              sel = .search
+              Task { await search.searchAll(keyword: word) }
+            }
+            .offset(y: 36)
+            .frame(width: 240, alignment: .leading)
+            .zIndex(10)
+          }
+        }
       }
     }
     .task { await state.reloadSource() }
@@ -933,6 +956,87 @@ struct CoverThumb: View {
   }
 }
 
+// MARK: - 搜索建议下拉（mg tipSearch 结果；点击直接搜）
+struct SuggestionsDropdown: View {
+  var items: [String]
+  var action: (String) -> Void
+  @State private var hovered: String?
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 0) {
+      ForEach(items.prefix(8), id: \.self) { word in
+        Button {
+          action(word)
+        } label: {
+          HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+              .font(.system(size: 11))
+              .foregroundStyle(Theme.text2)
+            Text(word)
+              .font(Theme.body())
+              .lineLimit(1)
+              .foregroundStyle(hovered == word ? Theme.text : Theme.text2)
+            Spacer()
+          }
+          .padding(.horizontal, 12)
+          .padding(.vertical, 7)
+          .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { h in hovered = h ? word : (hovered == word ? nil : hovered) }
+        .accessibilityLabel("搜索建议：\(word)")
+
+        if word != items.prefix(8).last {
+          Rectangle().fill(Theme.separator).frame(height: 1)
+            .padding(.leading, 32)
+        }
+      }
+    }
+    .padding(.vertical, 4)
+    .background(
+      RoundedRectangle(cornerRadius: Theme.radiusCard, style: .continuous)
+        .fill(Theme.card)
+        .shadow(color: .black.opacity(0.45), radius: 12, y: 6)
+    )
+  }
+}
+
+// MARK: - 词条流式布局（热门搜索词等 chip 列表；自适应网格近似流式）
+struct FlowChips: View {
+  var items: [String]
+  var action: (String) -> Void
+  @State private var hovered: String?
+
+  var body: some View {
+    LazyVGrid(
+      columns: [GridItem(.adaptive(minimum: 88, maximum: 180), spacing: 10)],
+      alignment: .leading,
+      spacing: 10
+    ) {
+      ForEach(items, id: \.self) { word in
+        Button {
+          action(word)
+        } label: {
+          Text(word)
+            .font(Theme.body())
+            .lineLimit(1)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .frame(maxWidth: .infinity)
+            .foregroundStyle(hovered == word ? Theme.text : Theme.text2)
+            .background(
+              Capsule().fill(hovered == word ? Theme.navHover : Theme.card)
+            )
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .onHover { h in hovered = h ? word : (hovered == word ? nil : hovered) }
+        .accessibilityLabel("搜索\(word)")
+      }
+    }
+  }
+}
+
 // MARK: - 搜索页 (SearchView)：单曲（多源聚合）/ 歌单（songlistSearch）两个 Tab
 struct SearchView: View {
   @Environment(SearchService.self) private var search
@@ -981,16 +1085,49 @@ struct SearchView: View {
     .accessibilityLabel("搜索类型")
   }
 
+  // MARK: 热门搜索词（无关键词时展示；mg 真实热词，回退静态词）
+
+  private var hotWordsView: some View {
+    ScrollView {
+      LazyVStack(alignment: .leading, spacing: 14) {
+        HStack {
+          Text("热门搜索")
+            .font(.title2.bold())
+            .foregroundStyle(.white)
+          if search.hotWordsLoading { ProgressView().controlSize(.small) }
+          Spacer()
+        }
+        .padding(.horizontal, 24)
+        .padding(.top, 16)
+
+        FlowChips(items: search.hotWords) { word in
+          search.clearSuggestions()
+          search.keyword = word
+          Task { await search.searchAll(keyword: word) }
+        }
+        .padding(.horizontal, 24)
+      }
+      .padding(.bottom, 20)
+      .frame(maxWidth: .infinity, alignment: .leading)
+      .spotifyScrollbar()
+    }
+    .task { await search.loadHotWords() }
+  }
+
   // MARK: 单曲结果（多源聚合）
 
   private func songsSection(scrollToken: Int) -> some View {
     Group {
       if search.results.isEmpty && !search.searching {
-        EmptyStateView(
-          title: search.keyword.isEmpty ? "搜索歌曲" : "未找到相关歌曲",
-          systemImage: "magnifyingglass",
-          description: search.keyword.isEmpty ? "输入关键词开始搜索" : "尝试更换关键词，或切到「歌单」搜索"
-        )
+        if search.keyword.isEmpty {
+          hotWordsView  // 无关键词：热门搜索词
+        } else {
+          EmptyStateView(
+            title: "未找到相关歌曲",
+            systemImage: "magnifyingglass",
+            description: "尝试更换关键词，或切到「歌单」搜索"
+          )
+        }
       } else {
         VStack(alignment: .leading, spacing: 0) {
           HStack {

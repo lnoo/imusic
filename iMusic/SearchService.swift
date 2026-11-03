@@ -24,6 +24,53 @@ final class SearchService {
 
   static let hotKeywords = ["周杰伦", "林俊杰", "陈奕迅", "薛之谦", "邓紫棋", "陶喆", "王菲", "许嵩"]
 
+  // MARK: 热门搜索词 + 搜索提示（mg tipSearch / hotSearch，原生迁移）
+  var hotWords: [String] = SearchService.hotKeywords
+  var hotWordsLoading = false
+  private var hotWordsFetched = false
+  var suggestions: [String] = []
+  var showSuggestions = false
+  private var suggestTask: Task<Void, Never>?
+  private var suggestSession = 0
+
+  /// 拉取热门搜索词：mg 有真实热词接口，失败/其他源回退静态 hotKeywords（每次会话只拉一次）
+  func loadHotWords() async {
+    guard !hotWordsLoading, !hotWordsFetched else { return }
+    hotWordsLoading = true
+    defer { hotWordsLoading = false }
+    hotWordsFetched = true
+    let words = await AnyListenResource.hotSearch(source: .mg)
+    if !words.isEmpty { hotWords = words }
+  }
+
+  /// 搜索框输入时的搜索提示（mg tipSearch；250ms 防抖，晚到的旧请求按会话号丢弃）
+  func suggest(_ keyword: String) {
+    suggestTask?.cancel()
+    let kw = keyword.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !kw.isEmpty else {
+      suggestions = []
+      showSuggestions = false
+      return
+    }
+    suggestSession += 1
+    let session = suggestSession
+    suggestTask = Task { [weak self] in
+      try? await Task.sleep(for: .milliseconds(250))
+      guard !Task.isCancelled, let self else { return }
+      let words = (try? await AnyListenResource.tipSearch(source: .mg, keyword: kw)) ?? []
+      guard session == self.suggestSession, !Task.isCancelled else { return }
+      self.suggestions = words
+      self.showSuggestions = !words.isEmpty
+    }
+  }
+
+  func clearSuggestions() {
+    suggestTask?.cancel()
+    suggestSession += 1
+    suggestions = []
+    showSuggestions = false
+  }
+
   /// TaskGroup 子任务的结果一律用具名 Sendable struct 传递，
   /// 不捕获 self/大 struct（release -O 下曾在此崩溃：
   /// AccumulatingTaskGroup::offer 内 tuple_initializeWithCopy 野指针）。
