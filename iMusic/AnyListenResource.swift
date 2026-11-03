@@ -118,6 +118,31 @@ struct ALMusicUrlInfo {
 /// Music.LyricInfo（iMusic 的 LyricInfo 即 its lyric/tlyric/rlyric/lxlyric 四元组）
 typealias ALLyricResult = LyricInfo
 
+/// Resource.MusicCommentItem（歌曲评论条目，对标 any-listen resource.d.ts）
+struct ALMusicCommentItem: Hashable, Sendable {
+  var id: String
+  var userId: String?
+  var userName: String
+  var text: String
+  var time: Int?
+  var images: [String]?
+  var location: String?
+  var avatar: String?
+  var likedCount: Int?
+  var skipPage: Bool?
+  var replyTotal: Int?
+  var reply: [ALMusicCommentItem]?
+  var replySkipPage: Bool?
+}
+
+/// IPCExtension.MusicCommentResult
+struct ALMusicCommentResult {
+  var list: [ALMusicCommentItem]
+  var total: Int
+  var limit: Int
+  var page: Int
+}
+
 // MARK: - any-listen 归一化工具（复刻 gdstudio 源扩展的 buildMusicInfo/格式化）
 
 /// 与 any-listen Music.Quality ↔ GD br 档位一一对应（gdstudio 源扩展 qualityToBr/brToQuality）
@@ -141,7 +166,6 @@ enum ALQualityBridge {
   /// gdstudio buildQualitysFromBr：从实际可用 br 生成「该档及以下全部音质」声明
   static func qualitys(fromBr br: Int) -> [MusicQualityType] {
     var qs: [MusicQualityType] = [.init(type: .q128k, size: nil)]
-    if br >= 192 { qs.append(.init(type: .q320k, size: nil)) }
     if br >= 320 { qs.append(.init(type: .q320k, size: nil)) }
     if br >= 740 { qs.append(.init(type: .flac, size: nil)) }
     if br >= 999 { qs.append(.init(type: .flac24bit, size: nil)) }
@@ -203,24 +227,55 @@ enum ALNormalize {
 /// 对外只暴露本分发器（UI/注册表通过 SourceRegistry 闭包接入，签名不变）。
 enum AnyListenResource {
   /// 搜索（musicSearch：name + artist + page/limit → ListCommonResult）
+  /// kw/tx/wy 走原生解析，失败/为空时回退 GD音乐台搜索（对标 gdstudio musicSearch 兜底）
   static func musicSearch(source: MusicSource, name: String, artist: String? = nil,
                           page: Int = 1, limit: Int = 30) async throws -> ALListResult<MusicInfo> {
     let kw = (artist?.isEmpty == false) ? "\(name) \(artist!)" : name
     switch source {
-    case .kw: return try await AnyListenKw.musicSearch(keyword: kw, page: page, limit: limit)
-    case .kg: return try await AnyListenKg.musicSearch(keyword: kw, page: page, limit: limit)
-    case .tx: return try await AnyListenTx.musicSearch(keyword: name, page: page, limit: limit)
-    case .wy: return try await AnyListenWy.musicSearch(keyword: kw, page: page, limit: limit)
-    case .mg: return try await AnyListenMg.musicSearch(keyword: kw, page: page, limit: limit)
+    case .kw:
+      return try await Self.nativeOrGD(.kw, name: kw, artist: nil) { try await AnyListenKw.musicSearch(keyword: kw, page: page, limit: limit) }
+    case .kg:
+      return try await AnyListenKg.musicSearch(keyword: kw, page: page, limit: limit)
+    case .tx:
+      return try await Self.nativeOrGD(.tx, name: name, artist: artist) { try await AnyListenTx.musicSearch(keyword: name, page: page, limit: limit) }
+    case .wy:
+      return try await Self.nativeOrGD(.wy, name: name, artist: artist) { try await AnyListenWy.musicSearch(keyword: kw, page: page, limit: limit) }
+    case .mg:
+      return try await AnyListenMg.musicSearch(keyword: kw, page: page, limit: limit)
     case .local: throw ALSourceError.unsupported(source)
     }
   }
 
-  /// 热搜词（hotSearch → string[]；仅网易有公开免费接口，其余源返回固定推荐词）
+  /// 原生优先、GD 兜底：原生抛错或空列表时回退 GD音乐台搜索
+  private static func nativeOrGD(_ source: MusicSource, name: String, artist: String?,
+                                 native: () async throws -> ALListResult<MusicInfo>) async throws -> ALListResult<MusicInfo> {
+    if let r = try? await native(), !r.list.isEmpty { return r }
+    return try await AnyListenGD.search(source: source, name: name, artist: artist)
+  }
+
+  /// 热搜词（hotSearch → string[]；wy/mg 有公开接口，其余源返回固定推荐词）
   static func hotSearch(source: MusicSource) async -> [String] {
     switch source {
     case .wy: return (try? await AnyListenWy.hotSearch()) ?? Self.defaultHotWords
+    case .mg: return (try? await AnyListenMg.hotSearch()) ?? Self.defaultHotWords
     default: return Self.defaultHotWords
+    }
+  }
+
+  /// 搜索提示（tipSearch → string[]；仅 mg 有公开接口）
+  static func tipSearch(source: MusicSource, keyword: String) async -> [String] {
+    switch source {
+    case .mg: return (try? await AnyListenMg.tipSearch(keyword: keyword)) ?? []
+    default: return []
+    }
+  }
+
+  /// 歌曲评论（musicComment → MusicCommentResult；仅 mg 已迁移）
+  static func musicComment(source: MusicSource, music: MusicInfo, type: String,
+                           page: Int, limit: Int = 20) async throws -> ALMusicCommentResult {
+    switch source {
+    case .mg: return try await AnyListenMg.musicComment(music: music, type: type, page: page, limit: limit)
+    default: throw ALSourceError.unsupported(source)
     }
   }
 
@@ -509,5 +564,62 @@ enum AnyListenGD {
             "\(api)?types=pic&source=\(src)&id=\(picId)&size=\(size)", headers: headers()) as? [String: Any],
           let u = json["url"] as? String, u.hasPrefix("http") else { return nil }
     return u
+  }
+
+  /// types=search（GD音乐台主 API 搜索；原生迁移自 gdstudio src/index.ts musicSearch + buildMusicInfo）
+  /// sourceName 返回 nil 的源（kg/mg/local）不支持 GD 搜索 → 返回空列表。
+  static func search(source: MusicSource, name: String, artist: String? = nil,
+                     page: Int = 1, limit: Int = 20) async throws -> ALListResult<MusicInfo> {
+    guard let src = sourceName(source) else {
+      throw ALSourceError.invalidResponse("GD音乐台不支持该源搜索")
+    }
+    // gdstudio: fetchCount = limit * 3，按 apiPage 请求，按 id 去重后切片出本页
+    let fetchCount = min(limit * 3, 50)
+    let queryName = (artist?.isEmpty == false) ? "\(name) \(artist!)" : name
+    let q = queryName.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? queryName
+    guard let json = try? await ALHttp.getJSON(
+      "\(api)?types=search&source=\(src)&count=\(fetchCount)&pages=\(page)&name=\(q)",
+      headers: headers()) else { return ALListResult(list: [], total: 0, page: page, limit: limit) }
+    let rawList = json as? [[String: Any]] ?? []
+    // 去重（按 id）
+    var seen = Set<String>()
+    var all: [MusicInfo] = []
+    for item in rawList {
+      let gid = ALHttp.str(item["id"])
+      guard !gid.isEmpty, seen.insert(gid).inserted else { continue }
+      all.append(mapSearchItem(item, source: src))
+    }
+    // 切片出当前页（gdstudio pagination.getPage(page, limit)）
+    let start = (page - 1) * limit
+    let list = start < all.count ? Array(all[start..<min(all.count, start + limit)]) : []
+    return ALListResult(list: list, total: all.count, page: page, limit: limit)
+  }
+
+  /// gdstudio buildMusicInfo：GD 原始条目 → MusicInfo
+  private static func mapSearchItem(_ item: [String: Any], source src: String) -> MusicInfo {
+    let gid = ALHttp.str(item["id"])
+    var interval: String? = nil
+    let dur = ALHttp.double(item["duration"]) ?? ALHttp.double(item["interval"]) ?? 0
+    if dur > 0 { interval = ALNormalize.formatInterval(Int(dur)) }
+    return MusicInfo(
+      name: ALHttp.str(item["name"]),
+      singer: ALNormalize.parseArtist(item["artist"]),
+      source: source(fromGd: src),
+      songmid: gid,
+      albumName: ALHttp.str(item["album"]),
+      interval: interval,
+      qualitys: [.init(type: .q128k, size: nil)],
+      picUrl: nil,
+      extra: ["_gdResourceVersion": "1"])
+  }
+
+  /// GD 源名 → iMusic MusicSource（sourceName 的逆映射；未知源回退本地占位）
+  private static func source(fromGd s: String) -> MusicSource {
+    switch s {
+    case "netease": return .wy
+    case "tencent": return .tx
+    case "kuwo": return .kw
+    default: return .local
+    }
   }
 }

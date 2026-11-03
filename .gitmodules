@@ -1,3 +1,15 @@
 [submodule "any-listen"]
 	path = any-listen
 	url = https://github.com/any-listen/any-listen.git
+[submodule "extensions/gdstudio"]
+	path = extensions/gdstudio
+	url = https://github.com/Morpheus799/gdstudio-repo
+[submodule "extensions/online-metadata"]
+	path = extensions/online-metadata
+	url = https://github.com/any-listen/any-listen-extension-online-metadata
+[submodule "extensions/lx-list-transform"]
+	path = extensions/lx-list-transform
+	url = https://github.com/any-listen/any-listen-extension-lx-list-transform
+[submodule "extensions/lx-api-source-loader"]
+	path = extensions/lx-api-source-loader
+	url = https://github.com/any-listen/any-listen-extension-lx-api-source-loader

@@ -330,11 +330,17 @@ final class UserApiEngine {
     }
     crypto.setObject(aes, forKeyedSubscript: "aesEncrypt" as NSString)
 
-    // rsaEncrypt：原项目 RSA_NO_PADDING（左补0到128字节）。MVP用 Security 实现 raw RSA。
+    // rsaEncrypt：原项目 RSA_NO_PADDING（左补0到128字节）。原生大数实现（Security 不依赖）。
     let rsa: @convention(block) (JSValue, String) -> JSValue = { buf, pemKey in
       let c = JSContext.current()!
-      c.exception = JSValue(newErrorFromMessage: "rsaEncrypt unsupported in MVP (need SecKey raw RSA)", in: c)
-      return JSValue(undefinedIn: c)
+      do {
+        let data = Self.jsToBytes(buf)
+        let out = try Self.rsaEncrypt(data: data, pemKey: pemKey)
+        return JSValue(object: out.map { Int($0) }, in: c)!
+      } catch {
+        c.exception = JSValue(newErrorFromMessage: "rsaEncrypt: \(error.localizedDescription)", in: c)
+        return JSValue(undefinedIn: c)
+      }
     }
     crypto.setObject(rsa, forKeyedSubscript: "rsaEncrypt" as NSString)
 
@@ -518,25 +524,92 @@ final class UserApiEngine {
 
   static func aesEncrypt(data: [UInt8], mode: String, key: [UInt8], iv: [UInt8]) throws -> [UInt8] {
     let m = mode.lowercased()
-    var options: CCOptions = 0
-    if m.contains("ecb") { options = CCOptions(kCCOptionPKCS7Padding | kCCOptionECBMode) }
-    else { options = CCOptions(kCCOptionPKCS7Padding) } // CBC
     let keyLen = (m.contains("256") || key.count > 16) ? kCCKeySizeAES256 : kCCKeySizeAES128
     var keyPadded = key
     if keyPadded.count < keyLen { keyPadded += [UInt8](repeating: 0, count: keyLen - keyPadded.count) }
     else { keyPadded = Array(keyPadded.prefix(keyLen)) }
     var ivPadded = iv
     if ivPadded.count < kCCBlockSizeAES128 { ivPadded += [UInt8](repeating: 0, count: kCCBlockSizeAES128 - ivPadded.count) }
+    ivPadded = Array(ivPadded.prefix(kCCBlockSizeAES128))
+
+    // CBC / ECB 走 CommonCrypto
+    if m.contains("ecb") {
+      return try cccrypt(data: data, key: keyPadded, keyLen: keyLen, iv: nil, options: CCOptions(kCCOptionPKCS7Padding | kCCOptionECBMode))
+    }
+    if m.contains("cbc") {
+      return try cccrypt(data: data, key: keyPadded, keyLen: keyLen, iv: ivPadded, options: CCOptions(kCCOptionPKCS7Padding))
+    }
+
+    // CFB / CTR / OFB：用原始 AES 块原语手动实现（对标 lx-music utils.crypto aesEncrypt）
+    let block = keyPadded
+    if m.contains("ctr") {
+      // aes-js CTR：initial counter = iv(16B)，大端自增，XOR 密钥流
+      var counter = ivPadded
+      var out = [UInt8](repeating: 0, count: data.count)
+      for i in 0..<data.count {
+        if i % 16 == 0 {
+          let ks = aesBlockEncrypt(counter, key: block)
+          for j in 0..<16 { if i + j < data.count { out[i + j] = data[i + j] ^ ks[j] } }
+          incrementCounter(&counter)
+        }
+      }
+      return out
+    }
+    if m.contains("ofb") {
+      // aes-js OFB：AES(prev) 作密钥流（prev 初值 = iv）
+      var prev = ivPadded
+      var out = [UInt8](repeating: 0, count: data.count)
+      for i in 0..<data.count {
+        if i % 16 == 0 { prev = aesBlockEncrypt(prev, key: block) }
+        out[i] = data[i] ^ prev[i % 16]
+      }
+      return out
+    }
+    if m.contains("cfb") {
+      // lx-music aes-128-cfb：segment size = 16（整块）；shift register 初值 = iv
+      var sr = ivPadded
+      var out = [UInt8](repeating: 0, count: data.count)
+      var i = 0
+      while i < data.count {
+        let ks = aesBlockEncrypt(sr, key: block)
+        for j in 0..<16 where i + j < data.count {
+          out[i + j] = data[i + j] ^ ks[j]
+        }
+        // shift register = 加密输出整块（非最后一整块时补零截断）
+        for j in 0..<16 { sr[j] = (i + j < data.count) ? out[i + j] : 0 }
+        i += 16
+      }
+      return out
+    }
+    // 兜底：无后缀的 cbc（lx 部分脚本直接给 "cbc"）
+    return try cccrypt(data: data, key: keyPadded, keyLen: keyLen, iv: ivPadded, options: CCOptions(kCCOptionPKCS7Padding))
+  }
+
+  /// CommonCrypto 单次 AES 加解密（CBC/ECB + PKCS7）
+  private static func cccrypt(data: [UInt8], key: [UInt8], keyLen: Int, iv: [UInt8]?, options: CCOptions) throws -> [UInt8] {
     let outCapacity = data.count + kCCBlockSizeAES128
     let outPtr = UnsafeMutablePointer<UInt8>.allocate(capacity: outCapacity)
     defer { outPtr.deallocate() }
     var outLen: size_t = 0
-    let status = keyPadded.withUnsafeBytes { kp in
-      ivPadded.withUnsafeBytes { ivp in
+    let status: CCCryptorStatus
+    if let iv {
+      status = key.withUnsafeBytes { kp in
+        iv.withUnsafeBytes { ivp in
+          data.withUnsafeBytes { dp in
+            CCCrypt(CCOperation(kCCEncrypt), CCAlgorithm(kCCAlgorithmAES), options,
+                    kp.baseAddress, keyLen,
+                    ivp.baseAddress,
+                    dp.baseAddress, data.count,
+                    outPtr, outCapacity, &outLen)
+          }
+        }
+      }
+    } else {
+      status = key.withUnsafeBytes { kp in
         data.withUnsafeBytes { dp in
           CCCrypt(CCOperation(kCCEncrypt), CCAlgorithm(kCCAlgorithmAES), options,
                   kp.baseAddress, keyLen,
-                  m.contains("ecb") ? nil : ivp.baseAddress,
+                  nil,
                   dp.baseAddress, data.count,
                   outPtr, outCapacity, &outLen)
         }
@@ -544,6 +617,243 @@ final class UserApiEngine {
     }
     guard status == kCCSuccess else { throw NSError(domain: "LX", code: -6, userInfo: [NSLocalizedDescriptionKey: "AES failed \(status)"]) }
     return Array(UnsafeBufferPointer(start: outPtr, count: Int(outLen)))
+  }
+
+  /// 原始 AES 单块加密（16 字节，ECB 无填充），作为 CFB/CTR/OFB 的块原语
+  private static func aesBlockEncrypt(_ block: [UInt8], key: [UInt8]) -> [UInt8] {
+    var b = block
+    if b.count < 16 { b += [UInt8](repeating: 0, count: 16 - b.count) }
+    let inBytes = Array(b.prefix(16))
+    var out = [UInt8](repeating: 0, count: 16)
+    var outLen: size_t = 0
+    key.withUnsafeBytes { kp in
+      inBytes.withUnsafeBytes { dp in
+        out.withUnsafeMutableBytes { op in
+          _ = CCCrypt(CCOperation(kCCEncrypt), CCAlgorithm(kCCAlgorithmAES),
+                      CCOptions(kCCOptionECBMode), // 无 PKCS7（输入整块）
+                      kp.baseAddress, key.count, nil,
+                      dp.baseAddress, 16,
+                      op.baseAddress, 16, &outLen)
+        }
+      }
+    }
+    return Array(out.prefix(Int(outLen)))
+  }
+
+  /// CTR 计数器大端自增（16 字节）
+  private static func incrementCounter(_ c: inout [UInt8]) {
+    for i in stride(from: 15, through: 0, by: -1) {
+      if c[i] == 255 { c[i] = 0 }
+      else { c[i] += 1; break }
+    }
+  }
+
+  /// 原始 RSA（RSA_NO_PADDING）：m^e mod n，左补 0 到模长。对标 lx-music rsaEncrypt
+  static func rsaEncrypt(data: [UInt8], pemKey: String) throws -> [UInt8] {
+    // 解析 PKCS#1 RSAPublicKey / SubjectPublicKeyInfo（BEGIN PUBLIC KEY / RSA PUBLIC KEY）
+    let base64 = pemKey
+      .replacingOccurrences(of: "-----BEGIN PUBLIC KEY-----", with: "")
+      .replacingOccurrences(of: "-----END PUBLIC KEY-----", with: "")
+      .replacingOccurrences(of: "-----BEGIN RSA PUBLIC KEY-----", with: "")
+      .replacingOccurrences(of: "-----END RSA PUBLIC KEY-----", with: "")
+      .replacingOccurrences(of: "\n", with: "").replacingOccurrences(of: "\r", with: "")
+    guard let der = Data(base64Encoded: base64) else {
+      throw NSError(domain: "LX", code: -7, userInfo: [NSLocalizedDescriptionKey: "RSA pem decode failed"])
+    }
+    guard let ints = derInts([UInt8](der)), ints.count >= 2 else {
+      throw NSError(domain: "LX", code: -7, userInfo: [NSLocalizedDescriptionKey: "RSA key parse failed"])
+    }
+    // 模数取最大 INTEGER，指数取最小 INTEGER
+    let modulus = ints.max { $0.count < $1.count } ?? ints[0]
+    let exponent = ints.min { $0.count < $1.count } ?? ints[ints.count - 1]
+
+    // 消息左补 0 到模长；超长报错
+    guard data.count <= modulus.count else {
+      throw NSError(domain: "LX", code: -7, userInfo: [NSLocalizedDescriptionKey: "RSA message too long"])
+    }
+    let msg = [UInt8](repeating: 0, count: modulus.count - data.count) + data
+    let m = RsaBig.fromBE(msg)
+    let n = RsaBig.fromBE(Array(modulus))
+    let e = RsaBig.fromBE(Array(exponent))
+    let c = RsaBig.modPow(m, e, n)
+    return RsaBig.toBE(c, padTo: modulus.count)
+  }
+
+  /// 内嵌 RSA 大数（little-endian 字节数组，index 0 = 低位；除以/移位安全）
+  private enum RsaBig {
+    static func fromBE(_ be: [UInt8]) -> [UInt8] {
+      var le = Array(be.reversed())
+      trim(&le)
+      return le.isEmpty ? [0] : le
+    }
+    static func toBE(_ le: [UInt8], padTo: Int) -> [UInt8] {
+      var rev = Array(le.reversed())
+      while rev.count < padTo { rev.insert(0, at: 0) }
+      return Array(rev.prefix(padTo))
+    }
+    static func trim(_ le: inout [UInt8]) {
+      while le.count > 1 && le[le.count - 1] == 0 { le.removeLast() }
+    }
+    static func isZero(_ le: [UInt8]) -> Bool { le.allSatisfy { $0 == 0 } }
+    static func isOdd(_ le: [UInt8]) -> Bool { le[0] & 1 == 1 }
+
+    /// 大数加（可处理进位溢出多一位）
+    static func add(_ a: [UInt8], _ b: [UInt8]) -> [UInt8] {
+      let n = max(a.count, b.count)
+      var out = [UInt8](repeating: 0, count: n + 1)
+      var carry: UInt16 = 0
+      for i in 0..<n {
+        let av = i < a.count ? UInt16(a[i]) : 0
+        let bv = i < b.count ? UInt16(b[i]) : 0
+        let s = av + bv + carry
+        out[i] = UInt8(s & 0xff)
+        carry = s >> 8
+      }
+      out[n] = UInt8(carry)
+      var r = out; trim(&r); return r
+    }
+
+    /// 大数减：前提 a >= b，返回 a-b
+    static func sub(_ a: [UInt8], _ b: [UInt8]) -> [UInt8] {
+      var out = a
+      var borrow: Int = 0
+      for i in 0..<a.count {
+        let bv = i < b.count ? Int(b[i]) : 0
+        var d = Int(a[i]) - bv - borrow
+        if d < 0 { d += 256; borrow = 1 } else { borrow = 0 }
+        out[i] = UInt8(d)
+      }
+      var r = out; trim(&r); return r
+    }
+
+    /// 大数左移一位（×2）
+    static func shl1(_ a: [UInt8]) -> [UInt8] {
+      var out = a
+      var carry: UInt8 = 0
+      for i in 0..<a.count {
+        let cur = a[i]
+        out[i] = (cur << 1) | carry
+        carry = (cur & 0x80) >> 7
+      }
+      if carry != 0 { out.append(carry) }
+      return out
+    }
+
+    /// 大数右移一位（÷2）
+    static func shr1(_ a: [UInt8]) -> [UInt8] {
+      var out = a
+      var carry: UInt8 = 0
+      for i in stride(from: a.count - 1, through: 0, by: -1) {
+        let cur = a[i]
+        out[i] = (cur >> 1) | carry
+        carry = (cur & 1) << 7
+      }
+      var r = out; trim(&r); return r
+    }
+
+    static func cmp(_ a: [UInt8], _ b: [UInt8]) -> Int {
+      if a.count != b.count { return a.count < b.count ? -1 : 1 }
+      for i in stride(from: a.count - 1, through: 0, by: -1) {
+        if a[i] != b[i] { return a[i] < b[i] ? -1 : 1 }
+      }
+      return 0
+    }
+
+    /// 大数乘（schoolbook，O(n²)）
+    static func mul(_ a: [UInt8], _ b: [UInt8]) -> [UInt8] {
+      if isZero(a) || isZero(b) { return [0] }
+      var out = [UInt8](repeating: 0, count: a.count + b.count)
+      for i in 0..<a.count {
+        var carry: UInt16 = 0
+        for j in 0..<b.count {
+          let cur = UInt16(out[i + j]) + UInt16(a[i]) * UInt16(b[j]) + carry
+          out[i + j] = UInt8(cur & 0xff)
+          carry = cur >> 8
+        }
+        var k = i + b.count
+        while carry > 0 {
+          let cur = UInt16(out[k]) + carry
+          out[k] = UInt8(cur & 0xff)
+          carry = cur >> 8
+          k += 1
+        }
+      }
+      var r = out; trim(&r); return r
+    }
+
+    /// 大数取模（二进制长除法：m 左移对齐 r 的最高位，从高位逐位移位减）
+    static func mod(_ a: [UInt8], _ m: [UInt8]) -> [UInt8] {
+      if isZero(m) { return a }
+      if cmp(a, m) < 0 { return a }
+      var r = a
+      let rMsb = msb(r), mMsb = msb(m)
+      var shifted = m
+      for _ in 0..<(rMsb - mMsb) { shifted = shl1(shifted) }
+      for _ in 0...(rMsb - mMsb) {
+        if cmp(r, shifted) >= 0 { r = sub(r, shifted) }
+        shifted = shr1(shifted)
+      }
+      while cmp(r, m) >= 0 { r = sub(r, m) }
+      return r
+    }
+    private static func leadingZeroBits(_ byte: UInt8) -> Int {
+      var b = byte, c = 0
+      while b != 0 { b >>= 1; c += 1 }
+      return 8 - c
+    }
+    private static func msb(_ x: [UInt8]) -> Int {
+      x.count * 8 - leadingZeroBits(x[x.count - 1]) - 1
+    }
+
+    /// 模幂：base^exp mod mod（平方-乘法）
+    static func modPow(_ base: [UInt8], _ exp: [UInt8], _ m: [UInt8]) -> [UInt8] {
+      var result: [UInt8] = [1]
+      var b = mod(base, m)
+      var e = exp
+      while !isZero(e) {
+        if isOdd(e) { result = mod(mul(result, b), m) }
+        b = mod(mul(b, b), m)
+        e = shr1(e)
+      }
+      return result
+    }
+  }
+
+  /// 解析 DER 中所有 INTEGER 的内容（大端字节）。递归进入 SEQUENCE/BIT STRING 容器，
+  /// 以取出 RSA 的 modulus/exponent（SPKI 与 PKCS#1 均适用）。
+  private static func derInts(_ bytes: [UInt8]) -> [[UInt8]]? {
+    var ints: [[UInt8]] = []
+    func walk(_ b: [UInt8]) {
+      var i = 0
+      while i < b.count {
+        let tag = b[i]
+        guard i + 1 < b.count else { break }
+        var len = Int(b[i + 1])
+        var header = 2
+        if len & 0x80 != 0 {
+          let nlen = len & 0x7f
+          guard i + 2 + nlen <= b.count else { break }
+          len = 0
+          for j in 0..<nlen { len = len << 8 | Int(b[i + 2 + j]) }
+          header = 2 + nlen
+        }
+        let start = i + header
+        guard start + len <= b.count else { break }
+        switch tag {
+        case 0x02: // INTEGER
+          ints.append(Array(b[start..<(start + len)]))
+        case 0x30: // SEQUENCE → 递归找 INTEGER
+          walk(Array(b[start..<(start + len)]))
+        case 0x03: // BIT STRING → 内容首字节为 unused-bits 计数，跳过再递归
+          walk(Array(b[(start + 1)..<(start + len)]))
+        default:
+          break
+        }
+        i = start + len
+      }
+    }
+    walk(bytes)
+    return ints
   }
 }
 

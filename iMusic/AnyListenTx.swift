@@ -89,15 +89,14 @@ enum AnyListenTx {
           let groups = data["group"] as? [[String: Any]] else { return [] }
     var out: [ALTopSongsItem] = []
     for g in groups {
-      let groupName = ALHttp.str(g["groupName"])
       for t in g["toplist"] as? [[String: Any]] ?? [] {
         let id = ALHttp.str(t["topId"])
         let name = ALHttp.str(t["title"])
         guard !id.isEmpty, !name.isEmpty else { continue }
         var pic = ALHttp.str(t["picUrl"])
         if pic.isEmpty, let front = (t["headPicUrl"] as? [String: Any]) { pic = ALHttp.str(front["pic"]) }
-        // 组名前缀避免不同分组的同名榜混淆（与 any-listen TopSongsItem {id,name,pic} 对齐）
-        out.append(ALTopSongsItem(id: id, name: groupName.isEmpty ? name : name, pic: pic.isEmpty ? nil : pic))
+        // 榜名用接口标题（TopSongsItem {id,name,pic}；按 id 区分同名榜，无需组名前缀）
+        out.append(ALTopSongsItem(id: id, name: name, pic: pic.isEmpty ? nil : pic))
       }
     }
     return out

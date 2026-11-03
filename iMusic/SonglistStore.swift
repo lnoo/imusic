@@ -33,10 +33,10 @@ final class SonglistStore {
   var detailLoading = false
   var detailError: String?
 
-  /// 支持标签浏览的源（kw/mg 无公开歌单接口）
-  static let browsableSources: [MusicSource] = [.wy, .tx]
+  /// 支持标签浏览的源（kw 无公开歌单接口；mg 已原生迁移自 online-metadata）
+  static let browsableSources: [MusicSource] = [.wy, .tx, .mg]
   /// 支持歌单搜索的源
-  static let searchableSources: [MusicSource] = [.wy, .tx, .kg]
+  static let searchableSources: [MusicSource] = [.wy, .tx, .kg, .mg]
 
   private var tagsLoadedSource = ""
   private var browseLoadedKey = ""

@@ -116,7 +116,7 @@ demo-source.js            # 可直接导入联调的最小源脚本
 | 隐藏 `BrowserWindow` + `preload lx` + `executeJavaScript(script)` | `JavaScriptCore JSContext` + 注入 `lx` | 无 DOM；依赖 DOM 的脚本会初始化失败（与原项目 error 上报对齐） |
 | `preload handleInit`：`allSources` + `supportQualitys` + `supportActions` 取交集；**非 local 默认只认 `musicUrl`** | `UserApiEngine.handleInited` 同表同逻辑 | 一致 |
 | `lx.request`（needle，timeout≤60s，JSON尝试解析，返回cancel） | `URLSession` 实现，超时 `min(timeout,60s)`，可取消 | 一致 |
-| `lx.utils.crypto/md5/aes/rsa/random + buffer + zlib + currentScriptInfo + version/env` | `md5✅ randomBytes✅ aes✅(CBC/ECB,128/256) buffer.from/bufToString✅ zlib✅ currentScriptInfo✅`；**`rsaEncrypt` 未实现**（MVP抛错） | 覆盖绝大多数源（网易 weapi 需 RSA 的源暂不支持） |
+| `lx.utils.crypto/md5/aes/rsa/random + buffer + zlib + currentScriptInfo + version/env` | `md5✅ randomBytes✅ aes✅(CBC/ECB/CFB/CTR/OFB,128/256) rsa✅(RSA_NO_PADDING 原生大数) buffer.from/bufToString✅ zlib✅ currentScriptInfo✅` | 覆盖绝大多数源（含网易 weapi 等需 RSA/流式 AES 的源）|
 | `handleRequest` 校验：`musicUrl/pic` 须 `^https?` ≤2048；`lyric.lyric≤51200/t/r≤5120/lx≤8192`；请求 20s 超时；切源取消 | `callScript` 同校验 + 20s 超时 | 一致 |
 | `useInitUserApi` 按 `actions` 动态生成 `getMusicUrl/getLyric/getPic` + `qualityList` | `engine.sources` + `PlayerStore.pickQuality`（高→低降级） | 一致 |
 | 搜索/歌单/榜单/歌词/封面解析 | `AnyListenResource` → 各源 `AnyListen*.swift`（any-listen 契约） | 五源全量；加密歌词内置解码 |
