@@ -7,16 +7,21 @@ import simd
 import SwiftUI
 
 // MARK: - 随心听卡片视觉层
+// 当前中心主体为 VinylDiscView（VinylDiscView.swift，旋转唱片）；
+// 本文件的 MascotSpriteView（流萤精灵宠物）保留为备选中心，
+// 在 HomeView 随心听卡片里二选一替换即可。
 // 两层 NSViewRepresentable 叠放在 168×168 方形卡片里：
-//  1. PulseShaderView —— Metal 背景：干净的渐变光斑（无噪声场/无颗粒），
-//     光斑半径随响度/低频呼吸，节拍触发柔光环；
+//  1. PulseShaderView —— Metal 背景：「雾海流萤·梦境」，星云雾 + 梦境光斑 +
+//     极光缎带 + 流萤 + 经典 LED 频谱地板（24 列 × 8 层彩色方块），随律动呼吸
+//     （低频呼吸/中频雾光/高频闪烁/节拍涌动/逐段频谱弹跳）；
 //  2. MascotSpriteView —— 社区素材「流萤」精灵宠物：待机呼吸 / 播放小跑 /
 //     击拍 squash&stretch 弹跳 / 切歌招手跳跃，纯 2D 帧动画（Core Animation）。
 // 两者都不接收 SwiftUI 状态参数：创建一次后靠总线自走，避免状态刷新重建视图。
 
 // MARK: - Metal shader 背景
 
-/// 与 Shaders.metal 里的 Uniforms 逐字节对应（5 × float4，共 80 字节）
+/// 与 Shaders.metal 里的 Uniforms 逐字节对应（5 × float4，共 80 字节，buffer(0)）；
+/// 另有 24 段频谱经 buffer(1) 传入（PulseFrame.bars，逐 float 排布，无对齐歧义）
 struct PulseUniforms {
   var colA: SIMD4<Float> // 强调色（rgb + 亮度增益）
   var colB: SIMD4<Float> // 深色底
@@ -97,6 +102,12 @@ struct PulseShaderView: NSViewRepresentable {
       )
       enc.setRenderPipelineState(pipeline)
       enc.setFragmentBytes(&u, length: MemoryLayout<PulseUniforms>.stride, index: 0)
+      // 频谱地板数据：24 段（PulseFrame.bars）走 buffer(1)
+      var barData = f.bars
+      if barData.count != PulseFrame.barCount {
+        barData = [Float](repeating: 0, count: PulseFrame.barCount)
+      }
+      enc.setFragmentBytes(&barData, length: barData.count * MemoryLayout<Float>.stride, index: 1)
       enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
       enc.endEncoding()
       buffer.present(drawable)

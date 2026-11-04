@@ -688,8 +688,9 @@ private struct RandomListenModule: View {
         // 底层：音乐律动 shader 背景（自走 PulseBus，无需 SwiftUI 状态驱动）
         PulseShaderView()
           .allowsHitTesting(false)
-        // 中层：流萤精灵宠物，播放小跑、随节拍弹跳、切歌招手
-        MascotSpriteView()
+        // 中层：旋转唱片（封面盘 + 唱针；径向频谱环在 shader 里绕盘一圈）
+        // 备选：MascotSpriteView 流萤精灵宠物（在 RandomListenMascot.swift，随时可换回）
+        VinylDiscView(coverURL: player.current?.picUrl)
           .allowsHitTesting(false)
           .padding(6)
         // 顶层：进度/失败/禁用仍需图标化状态语义（不靠颜色单独传达）

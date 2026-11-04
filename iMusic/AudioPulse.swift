@@ -5,8 +5,9 @@ import QuartzCore
 
 // MARK: - 随心听律动信号源
 // 旁路二次解码当前播放项（AVAssetReader → 单声道 Float 采样环），按名义播放头
-// 每帧取 4096 窗做 vDSP FFT，产出 低/中/高 频能量与节拍事件，驱动随心听卡片
-// 的 Metal shader 背景与 3D 角色。播放链路完全不变（仍 AVPlayer → 系统输出），
+// 每帧取 4096 窗做 vDSP FFT，产出 低/中/高 频能量、节拍事件与 24 段 log 频谱
+// （32Hz–9kHz，经典均衡器地板），驱动随心听卡片的 Metal shader 背景与 3D 角色。
+// 播放链路完全不变（仍 AVPlayer → 系统输出），
 // 不装 tap、不碰输出路由。流式格式旁路解码失败 / 数据不足时自动退回模拟律动
 // （约 104 BPM 近似信号），观感连续不断档。
 //
@@ -23,11 +24,16 @@ struct PulseFrame: Sendable {
   var beatAge: Double = 10 // 距上次击拍的秒数（驱动弹跳衰减）
   var beatIndex: Int = 0 // 击拍计数（角色动作触发）
   var morphIndex: Int = 0 // 换形态计数（表情/配色切换）
+  /// 24 段 log 频谱（32Hz–9kHz，各自 0...1）——经典均衡器地板
+  var bars: [Float] = Array(repeating: 0, count: PulseFrame.barCount)
   var live: Bool = false // 有真实音频驱动
   var active: Bool = false // 正在播放（含模拟兜底）
   var disabled: Bool = false // 卡片禁用态 → 视觉降饱和
   var error: Bool = false // 失败态 → 视觉偏红
   var hover: Bool = false
+
+  /// 频谱地板段数（Shaders.metal 的频谱柱循环与之对应）
+  static let barCount = 24
 }
 
 /// 跨线程快照总线
@@ -93,6 +99,11 @@ final class AudioPulse {
   private var bandBaseline: [Float] = [0, 0, 0, 0] // 各带对数能量慢基线（AGC，首窗播种）
   private var baselinesSeeded = false
   private var bassHistoryIndex = 0
+  private var barsRaw = [Float](repeating: 0, count: PulseFrame.barCount) // 本帧 24 段原始值
+  private var barsSmooth = [Float](repeating: 0, count: PulseFrame.barCount) // 快起慢落后的地板
+  private var barBaseline: Float = 0 // 全谱共享的 log 域慢基线（经典均衡器观感：左高右低）
+  private var barEdges: [Int] = [] // 24 段的 FFT bin 边界（前闭后开）
+  private var simBeatPulse: Float = 0 // 模拟兜底的击拍包络（喂给频谱地板）
   private var simPhase: Double = 0
   private var liveFor: TimeInterval = 999 // 距最近一次真实数据（秒）
   private var lastBeatTime: TimeInterval = 0
@@ -106,6 +117,15 @@ final class AudioPulse {
     let n = Double(windowCount)
     hann = (0..<windowCount).map { Float(0.5 - 0.5 * cos(2.0 * Double.pi * Double($0) / n)) }
     dftSetup = vDSP_DFT_zop_CreateSetup(nil, vDSP_Length(windowCount), .FORWARD)
+    // 频谱分桶：log 分布 32Hz–9kHz，bin ≈ 10.77Hz（bin 3…836 与三频段一致）
+    var edges = [3]
+    for j in 1...PulseFrame.barCount {
+      let f = 32.0 * pow(9000.0 / 32.0, Double(j) / Double(PulseFrame.barCount))
+      var b = Int((f / (sampleRate / n)).rounded())
+      if b <= edges[edges.count - 1] { b = edges[edges.count - 1] + 1 }
+      edges.append(min(b, 837))
+    }
+    barEdges = edges
     startSampler()
   }
 
@@ -117,6 +137,8 @@ final class AudioPulse {
     cursor = 0
     liveFor = 999
     baselinesSeeded = false
+    barsRaw = [Float](repeating: 0, count: PulseFrame.barCount)
+    barsSmooth = [Float](repeating: 0, count: PulseFrame.barCount)
     let gen = PulseBus.shared.bumpGeneration()
     guard let url = URL(string: urlString) else { return }
     DispatchQueue(label: "imusic.audiopulse.feed", qos: .userInitiated).async { [ring] in
@@ -128,6 +150,7 @@ final class AudioPulse {
   func detach() {
     ring.reset()
     cursor = 0
+    barsSmooth = [Float](repeating: 0, count: PulseFrame.barCount)
     _ = PulseBus.shared.bumpGeneration()
   }
 
@@ -159,6 +182,7 @@ final class AudioPulse {
     let dt = min(max(now - lastTickTime, 1.0 / 240.0), 0.1)
     lastTickTime = now
     let active = playing && gate > 0.02
+    simBeatPulse *= exp(-Float(dt) * 5.5) // 模拟兜底击拍包络的衰减
 
     // 播放头只在播放时推进；环里没解码到的部分自然补零
     if active { cursor += dt * sampleRate }
@@ -185,12 +209,21 @@ final class AudioPulse {
     } else if active {
       // 模拟兜底：~104 BPM 近似律动（旁路解码不可用 / 数据没跟上时）
       simPhase += dt * 104.0 / 60.0
-      if simPhase >= 1 { simPhase -= 1; beat = true }
+      if simPhase >= 1 { simPhase -= 1; beat = true; simBeatPulse = 1 }
       let t = Float(now)
       bassV = max(0, 0.55 + 0.4 * sin(t * 2.1))
       midV = max(0, 0.38 + 0.28 * sin(t * 1.37 + 1.0))
       trebleV = max(0, 0.24 + 0.22 * sin(t * 2.83 + 2.0))
       levelV = max(0, 0.42 + 0.28 * sin(t * 1.7 + 0.5))
+      // 模拟频谱：滚动波峰 + 击拍时低频侧隆起，与真实地板观感连续
+      let nF = Float(PulseFrame.barCount)
+      for j in 0..<PulseFrame.barCount {
+        let x = Float(j) / (nF - 1)
+        let v = 0.16 + 0.34 * max(0, sin(t * 3.3 + x * 5.2))
+             + 0.20 * max(0, sin(t * 2.05 - x * 3.1))
+             + simBeatPulse * (0.45 - 0.30 * x)
+        barsRaw[j] = min(1, max(0, v))
+      }
     }
 
     let gateF = Float(gate)
@@ -200,11 +233,23 @@ final class AudioPulse {
       let t = target * gateF
       return current + (t - current) * (t > current ? atk : rel)
     }
+    // 频谱地板：24 段各自快起慢落（经典均衡器的弹跳感）；停播归零
+    if !active {
+      for j in 0..<PulseFrame.barCount { barsRaw[j] = 0 }
+    }
+    let atkB: Float = 1 - exp(-Float(dt) * 30)
+    let relB: Float = 1 - exp(-Float(dt) * 4.2)
+    for j in 0..<PulseFrame.barCount {
+      let target = barsRaw[j] * gateF
+      let cur = barsSmooth[j]
+      barsSmooth[j] = cur + (target - cur) * (target > cur ? atkB : relB)
+    }
     PulseBus.shared.mutate { f in
       f.bass = smoothed(f.bass, bassV)
       f.mid = smoothed(f.mid, midV)
       f.treble = smoothed(f.treble, trebleV)
       f.level = smoothed(f.level, levelV)
+      f.bars = barsSmooth
       f.beatAge += dt
       f.live = live
       f.active = active
@@ -245,11 +290,29 @@ final class AudioPulse {
     }
     // 每带对数域 AGC：与慢基线比出相对动态，任何响度/码率的源都稳定
     var out = [logE(1, 20), logE(20, 140), logE(140, 836), logE(1, 836)]
+
+    // 24 段 log 频谱：能量求和 → dB，与全谱慢基线比出相对起伏
+    var barsE = [Float](repeating: 0, count: PulseFrame.barCount)
+    for j in 0..<PulseFrame.barCount {
+      let lo = barEdges[j], hi = barEdges[j + 1]
+      barsE[j] = hi > lo ? logE(lo, hi) : -120
+    }
+    let meanE = barsE.reduce(0, +) / Float(PulseFrame.barCount)
+
     if !baselinesSeeded {
       bandBaseline = out
+      barBaseline = meanE
+      barsRaw = [Float](repeating: 0.32, count: PulseFrame.barCount)
       baselinesSeeded = true
       return (0.45, 0.45, 0.45, 0.45) // 起播中性，避免头几秒被压制
     }
+    // 全谱共享基线（快跟慢放）：低频天然更高，左高右低的经典频谱形由此保留
+    barBaseline += (meanE - barBaseline) * (meanE > barBaseline ? 0.05 : 0.004)
+    for j in 0..<PulseFrame.barCount {
+      let tilt = 0.06 * Float(j) / Float(PulseFrame.barCount - 1) // 轻微抬高频，免得右端常年贴地
+      barsRaw[j] = min(1, max(0, 0.05 + (barsE[j] - barBaseline) / 9 + tilt))
+    }
+
     for i in 0..<4 {
       let e = out[i]
       let baseline = bandBaseline[i]
