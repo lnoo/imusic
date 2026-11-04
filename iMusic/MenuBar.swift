@@ -231,13 +231,13 @@ struct MenuBarView: View {
   }
 
   private var playbackSymbolName: String {
-    if player.playbackState == .failed { return "arrow.clockwise" }
+    if case .failed = player.playbackState { return "arrow.clockwise" }
     return player.isPlaying ? "pause.fill" : "play.fill"
   }
 
   private var playbackHelp: String {
-    if player.playbackState == .loading { return "正在加载" }
-    if player.playbackState == .failed { return "重试播放" }
+    if case .loading = player.playbackState { return "正在加载" }
+    if case .failed = player.playbackState { return "重试播放" }
     return player.isPlaying ? "暂停" : "播放"
   }
 

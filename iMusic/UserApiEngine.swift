@@ -442,9 +442,21 @@ final class UserApiEngine {
       }
       let fail: @convention(block) (JSValue) -> Void = { [weak self] e in
         guard let self else { return }
+        // 提取脚本错误：message 为主；仅当错误对象显式携带 code/data 字段时附加
+        // （普通 new Error 无这些字段，stack 对混淆脚本是乱码且无诊断价值，不透出）
+        let msg = e.toString() ?? "script error"
+        var fullMsg = msg
+        if let codeV = e.forProperty("code"), !codeV.isUndefined, !codeV.isNull,
+           codeV.toInt32() != 0 {
+          fullMsg = "[code:\(codeV.toInt32())] \(fullMsg)"
+        }
+        if let dataV = e.forProperty("data"), !dataV.isUndefined, !dataV.isNull,
+           dataV.isString, let d = dataV.toString(), !d.isEmpty {
+          fullMsg += " | data: \(d)"
+        }
         Task { @MainActor in
           if let c = self.pending.removeValue(forKey: id) {
-            c.resume(throwing: self.lxError(-3, e.toString() ?? "script error"))
+            c.resume(throwing: self.lxError(-3, fullMsg))
           }
         }
       }

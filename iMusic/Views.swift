@@ -3,7 +3,66 @@ import Observation
 
 // MARK: - Spotify 深色 UI：纯黑侧栏 / #121212 内容区 / 全宽底部播放条
 
-// MARK: - 空状态视图
+// MARK: - 源脚本更新横幅（engine 收到 lx.send('updateAlert') 时显示，如版本过低提醒）
+struct SourceUpdateBanner: Identifiable, Equatable {
+  let id = UUID()
+  let message: String
+  let updateUrl: String?
+}
+
+// MARK: - 源脚本更新横幅视图
+struct SourceUpdateBannerView: View {
+  let banner: SourceUpdateBanner
+  let onDismiss: () -> Void
+
+  var body: some View {
+    HStack(spacing: 12) {
+      Image(systemName: "arrow.down.circle.fill")
+        .font(.system(size: 16, weight: .medium))
+        .foregroundStyle(Theme.accent)
+
+      Text(banner.message)
+        .font(Theme.caption())
+        .foregroundStyle(Theme.text)
+        .lineLimit(3)
+        .frame(maxWidth: .infinity, alignment: .leading)
+
+      if let urlStr = banner.updateUrl, let url = URL(string: urlStr) {
+        Button("立即更新") {
+          NSWorkspace.shared.open(url)
+          onDismiss()
+        }
+        .buttonStyle(.borderedProminent)
+        .tint(Theme.accent)
+        .controlSize(.small)
+      }
+
+      Button {
+        onDismiss()
+      } label: {
+        Image(systemName: "xmark")
+          .font(.system(size: 12, weight: .medium))
+          .foregroundStyle(Theme.text2)
+      }
+      .buttonStyle(.plain)
+      .help("关闭")
+    }
+    .padding(.horizontal, 16)
+    .padding(.vertical, 10)
+    .background(
+      RoundedRectangle(cornerRadius: Theme.radiusRow, style: .continuous)
+        .fill(Theme.accent.opacity(0.12))
+        .overlay(
+          RoundedRectangle(cornerRadius: Theme.radiusRow, style: .continuous)
+            .stroke(Theme.accent.opacity(0.3), lineWidth: 1)
+        )
+    )
+    .padding(.horizontal, 16)
+    .padding(.top, 8)
+    .transition(.move(edge: .top).combined(with: .opacity))
+  }
+}
+
 struct EmptyStateView: View {
   let title: String
   let systemImage: String
@@ -117,6 +176,7 @@ struct ContentView: View {
   @State private var backStack: [SideItem] = []
   @State private var forwardStack: [SideItem] = []
   @State private var historyNavTarget: SideItem?
+  @State private var scriptErrorBanner: SourceUpdateBanner?
 
   private func goBack() {
     guard !backStack.isEmpty else { return }
@@ -137,6 +197,13 @@ struct ContentView: View {
   var body: some View {
     @Bindable var search = search
     VStack(spacing: 0) {
+      // 脚本错误/更新横幅
+      if let banner = scriptErrorBanner {
+        SourceUpdateBannerView(banner: banner) {
+          scriptErrorBanner = nil
+        }
+      }
+      
       HStack(spacing: 0) {
         SidebarView(sel: $sel)
           .frame(width: 232)
@@ -156,16 +223,17 @@ struct ContentView: View {
     }
     .background(Theme.sidebar)
     .preferredColorScheme(.dark)
-    .alert("源有更新", isPresented: .constant(state.api.updateAlert != nil)) {
-      Button("稍后") { state.api.updateAlert = nil }
-      if let u = state.api.updateAlert?.updateUrl, let url = URL(string: u) {
-        Button("查看更新") {
-          NSWorkspace.shared.open(url)
-          state.api.updateAlert = nil
-        }
+    // 源脚本更新提示统一走顶部横幅（SourceUpdateBannerView）：
+    // onChange 兜运行中收到的 alert，onAppear 兜视图安装前已存在的 alert
+    .onChange(of: state.api.updateAlert) { _, newAlert in
+      if let alert = newAlert {
+        scriptErrorBanner = SourceUpdateBanner(message: alert.log, updateUrl: alert.updateUrl)
       }
-    } message: {
-      Text(state.api.updateAlert?.log ?? "")
+    }
+    .onAppear {
+      if let alert = state.api.updateAlert {
+        scriptErrorBanner = SourceUpdateBanner(message: alert.log, updateUrl: alert.updateUrl)
+      }
     }
     .toolbar {
       ToolbarItem(placement: .navigation) {
@@ -348,6 +416,21 @@ struct PlayerBar: View {
   @State private var isHoverPlay = false
 
   private var currentSong: MusicInfo? { player.current }
+
+  /// 次级行内容：加载/失败态展示 status（解析进展、失败原因），稳态显示歌手。
+  /// status 的稳态文案（"正在播放 X"/"已暂停"）与播控按钮状态冗余，不展示。
+  private var secondaryLine: (text: String, color: Color, help: String) {
+    switch player.playbackState {
+    case .failed:
+      return (player.status, Theme.warning, player.status)
+    case .loading:
+      return (player.status, Theme.text2, player.status)
+    case .idle, .ready:
+      let singer = player.current?.singer ?? ""
+      return (singer, Theme.text2, singer)
+    }
+  }
+
   private var displayedCurrentTime: Double {
     guard player.duration.isFinite, player.duration > 0 else { return 0 }
     return isDraggingSlider ? player.duration * dragProgress : player.currentTime
@@ -432,10 +515,14 @@ struct PlayerBar: View {
             .foregroundStyle(Theme.text)
             .lineLimit(1)
 
-          Text(player.current?.singer ?? "")
+          // 次级行：加载/失败态展示 status 实时进展（解析中/换源中/失败原因），稳态显示歌手
+          Text(secondaryLine.text)
             .font(Theme.caption())
-            .foregroundStyle(Theme.text2)
+            .foregroundStyle(secondaryLine.color)
             .lineLimit(1)
+            .truncationMode(.tail)
+            .help(secondaryLine.help)
+            .accessibilityLabel(secondaryLine.help)
         }
       }
       .frame(width: 240, alignment: .leading)
@@ -472,7 +559,10 @@ struct PlayerBar: View {
           Button {
             player.toggle()
           } label: {
-            Image(systemName: player.playbackState == .failed ? "arrow.clockwise" : player.isPlaying ? "pause.fill" : "play.fill")
+            Image(systemName: {
+              if case .failed = player.playbackState { return "arrow.clockwise" }
+              return player.isPlaying ? "pause.fill" : "play.fill"
+            }())
               .font(.system(size: 14, weight: .bold))
               .foregroundStyle(.black)
               .frame(width: 32, height: 32)
@@ -484,8 +574,14 @@ struct PlayerBar: View {
           .disabled(!player.canTogglePlayback)
           .opacity(player.canTogglePlayback ? 1 : 0.5)
           .onHover { isHoverPlay = $0 }
-          .help(player.playbackState == .failed ? "重试播放" : player.isPlaying ? "暂停" : "播放")
-          .accessibilityLabel(player.playbackState == .failed ? "重试播放" : player.isPlaying ? "暂停" : "播放")
+          .help({
+            if case .failed = player.playbackState { return "重试播放" }
+            return player.isPlaying ? "暂停" : "播放"
+          }())
+          .accessibilityLabel({
+            if case .failed = player.playbackState { return "重试播放" }
+            return player.isPlaying ? "暂停" : "播放"
+          }())
 
           Button {
             player.next()

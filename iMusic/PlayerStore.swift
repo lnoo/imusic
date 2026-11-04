@@ -32,7 +32,7 @@ final class PlayerStore {
     case idle
     case loading
     case ready
-    case failed
+    case failed(String)
   }
 
   private(set) var playbackState: PlaybackState = .idle
@@ -42,7 +42,12 @@ final class PlayerStore {
   }
 
   var canTogglePlayback: Bool {
-    current != nil && (playbackState == .ready || playbackState == .failed)
+    current != nil && (playbackState == .ready || isFailed)
+  }
+  
+  private var isFailed: Bool {
+    if case .failed = playbackState { return true }
+    return false
   }
 
   var canSeek: Bool {
@@ -314,7 +319,7 @@ final class PlayerStore {
   }
 
   private func setPlaybackFailure(_ message: String) {
-    playbackState = .failed
+    playbackState = .failed(message)
     isPlaying = false
     resolvedUrl = nil
     pausedByRouteChangeDeviceUID = nil
@@ -434,7 +439,7 @@ final class PlayerStore {
     pausedByRouteChangeDeviceUID = nil // 手动操作后不再自动续播
     if on {
       guard canTogglePlayback else { return }
-      if playbackState == .failed, let current {
+      if case .failed = playbackState, let current {
         play(current)
       } else if !isPlaying {
         rewindIfNeeded()
@@ -461,7 +466,7 @@ final class PlayerStore {
       return
     }
     guard canTogglePlayback else { return }
-    if playbackState == .failed, let current {
+    if case .failed = playbackState, let current {
       play(current)
       return
     }

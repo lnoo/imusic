@@ -17,6 +17,7 @@ enum Theme {
   static let text2 = Color(hex: 0xB7BDB9)     // 次级文字
   static let field = Color(hex: 0x232724)      // 搜索框底
   static let danger = Color(hex: 0xE45B68)     // 危险操作（删除/错误）
+  static let warning = Color(hex: 0xF9A825)   // 警告/提示（版本过低、需更新）
 
   static let rowHover = Color(hex: 0x252925)
   static let separator = Color(hex: 0x343934)
