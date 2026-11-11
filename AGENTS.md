@@ -5,7 +5,7 @@
 `any-listen/` 是一个 **git submodule**（参考代码），仅作底层实现的参考用途：
 
 - **不要对它做任何改变**：不修改、不新增、不删除、不重构其任何文件。
-- **不要提交/修改该 submodule 内部的变更**（包括但不限于 `git add`、`git commit`、`git submodule update` 等对 submodule 内指针或内容的改动）。
+- **不要对 submodule 内部做任何 git 操作**：不 `git add`/`git commit`、不改动其工作区内容或分支；submodule **指针**的更新只允许按下方「🔄 Submodule 更新跟进流程」在主仓库侧进行。
 - **它的作用只是参考**：本项目 `iMusic/` 内的 AnyListen 系列解析层、资源动作契约、数据模型等「严格对齐」`@any-listen/` 时，只允许**读取**它的源码作为参照，任何改动都必须落在本项目自己的文件里。
 
 违反此限制的变更一律不予接受。
@@ -27,3 +27,14 @@
 > 运行时在线播放：后三个联合使用达成完全效果，GD音悦台为功能增强。
 > 这些扩展的运行态安装在 any-listen 的 `packages/web-server/data/app/extension/ext/`（由扩展商店运行时拉取），
 > 此处作为 submodule 保留其**源码**以便 iMusic 侧参照，不承担运行时的安装职责。
+
+---
+
+## 🔄 Submodule 更新跟进流程
+
+submodule 内部内容始终只读（同上）；submodule **指针**按以下流程在主仓库侧维护：
+
+1. **拉取**：在各 submodule 内 `git fetch --all --tags`，对比当前检出与远端最新（release tag / main）。
+2. **审查**：逐条读增量提交与 diff，判断是否涉及 iMusic 对齐层（解析层、资源动作契约、数据模型、扩展宿主 API）。
+3. **同步**：有涉及 → 先在本项目自己的文件里完成 Swift 参照同步并验证；无涉及 → 在提交信息中明确记录「无需同步」及理由。
+4. **提交指针**：同步完成（或确认无需同步）后，主仓库 `git add <submodule路径>` 提交指针更新；提交信息需附每笔增量的审查结论。
