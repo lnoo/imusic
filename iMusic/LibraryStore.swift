@@ -26,7 +26,12 @@ final class LibraryStore {
 
   init() { load() }
 
-  private struct Root: Codable { var playlists: [Playlist]; var history: [MusicInfo] }
+  private struct Root: Codable {
+    var playlists: [Playlist]
+    var history: [MusicInfo]
+    /// 「我喜欢」最新在前的一次性迁移标记：旧数据按添加先后正序存储，读入时反转为最新在前
+    var favNewestFirst: Bool?
+  }
   private var file: URL { dir.appendingPathComponent("library.json") }
 
   func load() {
@@ -37,10 +42,15 @@ final class LibraryStore {
     }
     playlists = r.playlists.isEmpty ? [Playlist(id: "fav", name: "我喜欢", songs: [])] : r.playlists
     history = r.history
+    // 一次性迁移：旧版「我喜欢」最早添加在前，反转为最新在前（此后 add 固定插到顶部）
+    if r.favNewestFirst != true, let i = playlists.firstIndex(where: { $0.id == "fav" }) {
+      playlists[i].songs.reverse()
+      save()
+    }
   }
 
   private func save() {
-    let r = Root(playlists: playlists, history: Array(history.prefix(100)))
+    let r = Root(playlists: playlists, history: Array(history.prefix(100)), favNewestFirst: true)
     if let d = try? JSONEncoder().encode(r) { try? d.write(to: file) }
   }
 
@@ -57,11 +67,16 @@ final class LibraryStore {
     guard id != "fav" else { return }
     playlists.removeAll { $0.id == id }; save()
   }
-  /// 按 id 去重加入（对标 list 去重逻辑）
+  /// 按 id 去重加入（对标 list 去重逻辑）；「我喜欢」固定插入顶部，最新添加在最上（对标 list.addMusicLocationType: 'top'）
   func add(_ song: MusicInfo, to playlistId: String) {
     guard let i = playlists.firstIndex(where: { $0.id == playlistId }),
           !playlists[i].songs.contains(where: { $0.id == song.id }) else { return }
-    playlists[i].songs.append(song); save()
+    if playlistId == "fav" {
+      playlists[i].songs.insert(song, at: 0)
+    } else {
+      playlists[i].songs.append(song)
+    }
+    save()
   }
   func remove(_ song: MusicInfo, from playlistId: String) {
     guard let i = playlists.firstIndex(where: { $0.id == playlistId }) else { return }
