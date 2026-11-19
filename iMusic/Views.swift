@@ -1369,12 +1369,20 @@ struct NowPlayingView: View {
   @Environment(SearchService.self) private var search
   @Binding var sel: SideItem
   @State private var singerHovered = false
+  @State private var albumHovered = false
+
+  /// 封面复制/下载的默认文件名（「歌手 - 歌名」；清洗在 CoverImageActions 内做）
+  private var coverSuggestedName: String {
+    let c = player.current
+    let parts = [c?.singer, c?.name].compactMap { $0 }.filter { !$0.isEmpty }
+    return parts.isEmpty ? "封面" : parts.joined(separator: " - ")
+  }
 
   var body: some View {
     HStack(spacing: 28) {
       // 左侧：专辑艺术
       VStack(alignment: .leading, spacing: 18) {
-        CoverBig(url: player.current?.picUrl)
+        CoverBig(url: player.current?.picUrl, suggestedName: coverSuggestedName)
 
         VStack(alignment: .leading, spacing: 6) {
           Text(player.current?.name ?? "")
@@ -1398,11 +1406,20 @@ struct NowPlayingView: View {
               .help("搜索该歌手")
           }
 
+          // 点专辑 → 切到搜索页并搜该专辑（与歌手同款交互；搜索框关键词同步更新）
           if let album = player.current?.albumName, !album.isEmpty {
             Text(album)
               .font(.subheadline)
-              .foregroundStyle(Theme.text2.opacity(0.7))
+              .foregroundStyle(albumHovered ? Theme.text2 : Theme.text2.opacity(0.7))
+              .underline(albumHovered)
               .lineLimit(1)
+              .onHover { albumHovered = $0 }
+              .onTapGesture {
+                search.keyword = album
+                sel = .search
+                Task { await search.searchAll(keyword: album) }
+              }
+              .help("搜索该专辑")
           }
         }
 
@@ -1423,6 +1440,10 @@ struct NowPlayingView: View {
 
 struct CoverBig: View {
   var url: String?
+  /// 复制/下载的默认文件名（不含扩展名，扩展名按图片真实格式补）
+  var suggestedName: String = "封面"
+  @State private var isHovered = false
+
   var body: some View {
     Group {
       if let u = url, let link = URL(string: u) {
@@ -1441,6 +1462,15 @@ struct CoverBig: View {
     .frame(width: 260, height: 260)
     .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
     .shadow(color: .black.opacity(0.5), radius: 24, y: 12)
+    // 封面动作浮层：hover 显形「复制 / 下载」（有封面才挂）
+    .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    .overlay(alignment: .topTrailing) {
+      if url != nil {
+        CoverActionsOverlay(urlString: url, suggestedName: suggestedName, isHovered: isHovered)
+          .padding(10)
+      }
+    }
+    .onHover { isHovered = $0 }
   }
 
   private var fallback: some View {
