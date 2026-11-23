@@ -8,7 +8,7 @@ struct SourceSettingsView: View {
   @Environment(UserApiStore.self) private var api
   @Environment(UserApiEngine.self) private var engine
 
-  @State private var urlInput = "https://ghproxy.net/raw.githubusercontent.com/pdone/lx-music-source/main/lx/latest.js"
+  @State private var urlInput = ""
   @State private var importing = false
   @State private var error: String?
   @State private var showImporter = false
@@ -148,7 +148,15 @@ struct SourceSettingsView: View {
             .disabled(!canImport)
           }
 
-          Text("已预填合集地址（ghproxy 加速）。导入后若提示初始化超时，请检查脚本是否符合 LX 规范。")
+          HStack(spacing: 4) {
+            Text("脚本地址可从 LX 源仓库获取：")
+              .font(Theme.caption())
+              .foregroundStyle(Theme.text2)
+            Link("github.com/pdone/lx-music-source",
+                 destination: URL(string: "https://github.com/pdone/lx-music-source")!)
+              .font(Theme.caption())
+          }
+          Text("导入后若提示初始化超时，请检查脚本是否符合 LX 规范。")
             .font(Theme.caption())
             .foregroundStyle(Theme.text2)
 
