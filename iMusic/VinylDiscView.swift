@@ -113,7 +113,9 @@ final class VinylDiscController: NSObject {
     layout()
     showArm(animated: false)
 
-    let t = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in self?.tick() }
+    let t = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+      MainActor.assumeIsolated { self?.tick() }
+    }
     RunLoop.main.add(t, forMode: .common)
     timer = t
   }
@@ -140,15 +142,15 @@ final class VinylDiscController: NSObject {
       applyCover(cached, token: token)
       return
     }
-    DispatchQueue.global(qos: .userInitiated).async {
+    DispatchQueue.global(qos: .userInitiated).async { [weak self] in
       guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
             let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, [
               kCGImageSourceCreateThumbnailFromImageAlways: true,
               kCGImageSourceCreateThumbnailWithTransform: true,
               kCGImageSourceThumbnailMaxPixelSize: 512,
             ] as CFDictionary) else { return }
-      CoverCache.cache.setObject(cg, forKey: raw as NSString)
       DispatchQueue.main.async { [weak self] in
+        CoverCache.cache.setObject(cg, forKey: raw as NSString)
         self?.applyCover(cg, token: token)
       }
     }

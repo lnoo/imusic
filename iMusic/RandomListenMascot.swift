@@ -183,7 +183,8 @@ struct MascotSpriteView: NSViewRepresentable {
 
 /// 60Hz 主线程 tick：读 PulseBus 推进帧动画 + 事件（击拍弹跳 / 切歌打招呼）。
 /// 帧图只是 layer.contents 指针切换，弹跳交给 Core Animation，CPU 开销可忽略。
-final class SpritePetController: NSObject, @unchecked Sendable {
+@MainActor
+final class SpritePetController: NSObject {
   private weak var host: NSView?
   private let frameLayer = CALayer() // 最内：精灵帧图（弹跳 transform）
   private let outerLayer = CALayer() // 外层：hover 缩放
@@ -219,7 +220,9 @@ final class SpritePetController: NSObject, @unchecked Sendable {
     layout()
     show(.idle) // 开机待机，等总线状态接管
 
-    let t = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in self?.tick() }
+    let t = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+      MainActor.assumeIsolated { self?.tick() }
+    }
     RunLoop.main.add(t, forMode: .common)
     timer = t
   }

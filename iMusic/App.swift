@@ -1,5 +1,8 @@
 import SwiftUI
 import Observation
+// Xcode 27 构建期会跑 AppIntentsMetadataExtractor；显式链接 AppIntents 可避免
+// “Metadata extraction skipped, no AppIntents.framework dependency found” 警告。
+import AppIntents
 
 // MARK: - AppState：胶水层，对标 src/renderer/core/apiSource.ts#setUserApi
 // + useInitUserApi.ts（status->构建apis/qualityList/apiInitPromise）

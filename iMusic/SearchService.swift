@@ -57,7 +57,7 @@ final class SearchService {
     suggestTask = Task { [weak self] in
       try? await Task.sleep(for: .milliseconds(250))
       guard !Task.isCancelled, let self else { return }
-      let words = (try? await AnyListenResource.tipSearch(source: .mg, keyword: kw)) ?? []
+      let words = await AnyListenResource.tipSearch(source: .mg, keyword: kw)
       guard session == self.suggestSession, !Task.isCancelled else { return }
       self.suggestions = words
       self.showSuggestions = !words.isEmpty

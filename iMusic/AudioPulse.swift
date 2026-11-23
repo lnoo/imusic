@@ -141,8 +141,8 @@ final class AudioPulse {
     barsSmooth = [Float](repeating: 0, count: PulseFrame.barCount)
     let gen = PulseBus.shared.bumpGeneration()
     guard let url = URL(string: urlString) else { return }
-    DispatchQueue(label: "imusic.audiopulse.feed", qos: .userInitiated).async { [ring] in
-      Self.feed(assetURL: url, gen: gen, ring: ring)
+    Task.detached(priority: .userInitiated) { [ring] in
+      await Self.feed(assetURL: url, gen: gen, ring: ring)
     }
   }
 
@@ -390,14 +390,13 @@ final class SampleRing: @unchecked Sendable {
 extension AudioPulse {
   /// 二次解码到采样环。节奏预算：领先播放头不超过 1.5s，避免起播瞬间
   /// 把整首歌解完冲 CPU；数据跟不上时由上层自动落模拟律动。
-  nonisolated fileprivate static func feed(assetURL: URL, gen: Int, ring: SampleRing) {
+  nonisolated fileprivate static func feed(assetURL: URL, gen: Int, ring: SampleRing) async {
     let rate = 44_100.0
     let warm = Int(rate * 0.5) // 预解码半秒
     let ahead = Int(rate * 1.5)
-    // 注意：不能传 PreferPreciseDurationAndTiming=false，实测会导致 tracks 同步取空
     let asset = AVURLAsset(url: assetURL)
     guard
-      let track = asset.tracks(withMediaType: .audio).first,
+      let track = try? await asset.loadTracks(withMediaType: .audio).first,
       let reader = try? AVAssetReader(asset: asset)
     else { return }
     let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
@@ -409,40 +408,41 @@ extension AudioPulse {
       AVNumberOfChannelsKey: 1,
       AVSampleRateKey: rate,
     ])
-    reader.add(output)
-    guard reader.startReading() else { return }
+    let provider = reader.outputProvider(for: output)
+    do { try reader.start() } catch { return }
 
-    /// 解一帧进环；false = 解码器无更多数据
-    func decodeOne() -> Bool {
-      guard let sample = output.copyNextSampleBuffer() else { return false }
-      defer { CMSampleBufferInvalidate(sample) }
-      var listStorage = AudioBufferList(
-        mNumberBuffers: 1,
-        mBuffers: AudioBuffer(mNumberChannels: 0, mDataByteSize: 0, mData: nil)
-      )
-      var block: CMBlockBuffer?
-      let status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
-        sample,
-        bufferListSizeNeededOut: nil,
-        bufferListOut: &listStorage,
-        bufferListSize: MemoryLayout<AudioBufferList>.size,
-        blockBufferAllocator: nil,
-        blockBufferMemoryAllocator: nil,
-        flags: 0,
-        blockBufferOut: &block
-      )
-      guard status == noErr, let data = listStorage.mBuffers.mData else { return true }
-      let frames = CMSampleBufferGetNumSamples(sample)
-      guard frames > 0 else { return true }
-      data.bindMemory(to: Float.self, capacity: Int(frames)).withMemoryRebound(to: Float.self, capacity: Int(frames)) { ptr in
-        ring.append(ptr, frames)
+    /// 解一帧进环；false = 解码器无更多数据（新 API 用 Provider.next() 取已就绪采样）
+    func decodeOne() async -> Bool {
+      guard let ready = try? await provider.next() else { return false }
+      return ready.withUnsafeSampleBuffer { sample in
+        var listStorage = AudioBufferList(
+          mNumberBuffers: 1,
+          mBuffers: AudioBuffer(mNumberChannels: 0, mDataByteSize: 0, mData: nil)
+        )
+        var block: CMBlockBuffer?
+        let status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+          sample,
+          bufferListSizeNeededOut: nil,
+          bufferListOut: &listStorage,
+          bufferListSize: MemoryLayout<AudioBufferList>.size,
+          blockBufferAllocator: nil,
+          blockBufferMemoryAllocator: nil,
+          flags: 0,
+          blockBufferOut: &block
+        )
+        guard status == noErr, let data = listStorage.mBuffers.mData else { return true }
+        let frames = CMSampleBufferGetNumSamples(sample)
+        guard frames > 0 else { return true }
+        data.bindMemory(to: Float.self, capacity: Int(frames)).withMemoryRebound(to: Float.self, capacity: Int(frames)) { ptr in
+          ring.append(ptr, frames)
+        }
+        return true
       }
-      return true
     }
 
     var warmed = 0
     while reader.status == .reading, warmed < warm {
-      guard decodeOne() else { break }
+      guard await decodeOne() else { break }
       warmed = ring.framesWritten
       if PulseBus.shared.generation != gen { break }
     }
@@ -450,9 +450,9 @@ extension AudioPulse {
       if PulseBus.shared.generation != gen { break }
       let backlog = ring.framesWritten - Int(PulseBus.shared.cursorFrames)
       if backlog < ahead {
-        guard decodeOne() else { break }
+        guard await decodeOne() else { break }
       } else {
-        Thread.sleep(forTimeInterval: 0.1)
+        try? await Task.sleep(for: .milliseconds(100))
       }
     }
     if reader.status == .reading { reader.cancelReading() }
