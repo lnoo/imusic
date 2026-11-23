@@ -61,11 +61,18 @@ enum AnyListenTx {
       return "https://y.gtimg.cn/music/photo_new/T002R500x500M000\(albumMid).jpg"
     }()
     let secs = ALHttp.int(item["interval"]) ?? 0
+    // 歌名：name 为干净本体，title = <em>高亮本体</em> + title_extra 版本后缀（如
+    // " (Single Version)"）→ 用 name + title_extra 组装，避免 <em> 进搜索/播放页；
+    // name 缺失才回退 title（decode 已剥 <em>）
+    let baseName = ALHttp.str(item["name"])
+    let rawName = baseName.isEmpty
+      ? ALHttp.str(item["title"] ?? item["name"])
+      : baseName + ALHttp.str(item["title_extra"])
     return MusicInfo(
-      name: ALHttp.str(item["title"] ?? item["name"]),
-      singer: iMusicSign.singerNames(singers),
+      name: iMusicSign.decode(rawName),
+      singer: iMusicSign.decode(iMusicSign.singerNames(singers)),
       source: .tx, songmid: mid,
-      albumName: ALHttp.str(album["name"]),
+      albumName: iMusicSign.decode(ALHttp.str(album["name"])),
       interval: secs > 0 ? iMusicSign.mmss(secs) : nil,
       qualitys: quals.isEmpty ? [.init(type: .q128k, size: nil)] : quals,
       picUrl: pic,

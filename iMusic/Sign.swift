@@ -31,9 +31,11 @@ enum iMusicSign {
     return String(format: "%.2fG", b / 1024 / 1024 / 1024)
   }
 
-  /// HTML 反转义（对标 decodeName；原实现实体字面量损坏导致整串替换失效，本次修复）
+  /// HTML 反转义 + 搜索高亮标签剥离（对标 decodeName；搜索接口会把命中词包进
+  /// <em>…</em>，如 QQ `title`、酷狗 `SongName`，须剥掉后再入 MusicInfo）
   static func decode(_ s: String) -> String {
-    let entities = [("&nbsp;", " "), ("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"), ("&quot;", "\""), ("&39;", "'"), ("&#039;", "'")]
+    let entities = [("<em>", ""), ("</em>", ""),
+                    ("&nbsp;", " "), ("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"), ("&quot;", "\""), ("&39;", "'"), ("&#039;", "'")]
     var out = s
     for (e, v) in entities { out = out.replacingOccurrences(of: e, with: v) }
     return out
