@@ -410,6 +410,7 @@ struct PlayerBar: View {
   @State private var dragProgress: Double = 0
   @State private var pendingSeekTask: Task<Void, Never>?
   @State private var showVolume = false
+  @State private var showComments = false
   @State private var isHoveringVolume = false
   @State private var dismissVolumeTask: Task<Void, Never>?
   @State private var isHoverCover = false
@@ -662,6 +663,21 @@ struct PlayerBar: View {
         .help("下载")
         .disabled(currentSong == nil)
         .opacity(currentSong == nil ? 0.35 : 1)
+
+        Button { showComments = true } label: {
+          Image(systemName: "bubble.right")
+            .font(.system(size: 14))
+            .foregroundStyle(Theme.text2)
+        }
+        .buttonStyle(.plain)
+        .help("评论")
+        .disabled(currentSong == nil)
+        .sheet(isPresented: $showComments) {
+          if let song = currentSong {
+            CommentSheet(music: song)
+              .frame(minWidth: 520, minHeight: 520)
+          }
+        }
 
         Button {
           withAnimation(.easeInOut(duration: 0.15)) { showVolume.toggle() }
@@ -1181,7 +1197,7 @@ struct SearchView: View {
     .accessibilityLabel("搜索类型")
   }
 
-  // MARK: 热门搜索词（无关键词时展示；mg 真实热词，回退静态词）
+  // MARK: 热门搜索词（无关键词时展示；对齐 online-metadata 五源 hotSearch，失败回退静态词）
 
   private var hotWordsView: some View {
     ScrollView {
@@ -1192,6 +1208,17 @@ struct SearchView: View {
             .foregroundStyle(.white)
           if search.hotWordsLoading { ProgressView().controlSize(.small) }
           Spacer()
+          Picker("热词来源", selection: Binding(
+            get: { search.suggestSource },
+            set: { search.suggestSource = $0 }
+          )) {
+            ForEach([MusicSource.kw, .kg, .tx, .wy, .mg], id: \.self) { src in
+              Text(SourceRegistry.capability(id: src.rawValue)?.displayName ?? src.rawValue).tag(src)
+            }
+          }
+          .pickerStyle(.menu)
+          .labelsHidden()
+          .tint(Theme.accent)
         }
         .padding(.horizontal, 24)
         .padding(.top, 16)
@@ -1944,5 +1971,122 @@ struct DownloadsView: View {
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity)
     .background(Theme.bg)
+  }
+}
+
+// MARK: - 歌曲评论（对齐 online-metadata 五源 musicComment：hot / new 分页）
+
+struct CommentSheet: View {
+  let music: MusicInfo
+  @Environment(\.dismiss) private var dismiss
+
+  private enum Kind: String { case hot, new }
+  @State private var kind: Kind = .hot
+  @State private var page = 1
+  @State private var items: [ALMusicCommentItem] = []
+  @State private var total = 0
+  @State private var loading = false
+  @State private var error: String?
+
+  private var hasMore: Bool { items.count < total }
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 12) {
+      HStack {
+        Text("评论 · \(music.name)")
+          .font(Theme.title())
+          .foregroundStyle(Theme.text)
+          .lineLimit(1)
+        Spacer()
+        Picker("类型", selection: $kind) {
+          Text("热门").tag(Kind.hot)
+          Text("最新").tag(Kind.new)
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .tint(Theme.accent)
+        .frame(width: 180)
+        Button("关闭") { dismiss() }
+          .buttonStyle(.plain)
+          .foregroundStyle(Theme.text2)
+      }
+
+      if let e = error {
+        Label(e, systemImage: "exclamationmark.triangle.fill")
+          .font(Theme.caption())
+          .foregroundStyle(Theme.danger)
+      }
+
+      ScrollView {
+        LazyVStack(alignment: .leading, spacing: 12) {
+          ForEach(items, id: \.id) { item in
+            VStack(alignment: .leading, spacing: 4) {
+              HStack(spacing: 6) {
+                Text(item.userName.isEmpty ? "匿名" : item.userName)
+                  .font(Theme.body(.semibold))
+                  .foregroundStyle(Theme.text)
+                if let t = item.time, t > 0 {
+                  Text(Date(timeIntervalSince1970: TimeInterval(t) / 1000), style: .relative)
+                    .font(Theme.caption())
+                    .foregroundStyle(Theme.text2)
+                }
+                Spacer()
+                if let n = item.likedCount { Text("♥ \(n)").font(Theme.caption()).foregroundStyle(Theme.text2) }
+              }
+              Text(item.text)
+                .font(Theme.bodySM())
+                .foregroundStyle(Theme.text)
+                .textSelection(.enabled)
+              if let replies = item.reply, !replies.isEmpty {
+                ForEach(replies, id: \.id) { r in
+                  Text("  ↳ \(r.userName)：\(r.text)")
+                    .font(Theme.caption())
+                    .foregroundStyle(Theme.text2)
+                }
+              }
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: Theme.radiusRow).fill(Theme.card))
+          }
+
+          if hasMore {
+            Button("加载更多") { Task { await load(more: true) } }
+              .buttonStyle(.plain)
+              .font(Theme.caption(.semibold))
+              .foregroundStyle(Theme.accent)
+              .disabled(loading)
+          } else if !loading && items.isEmpty && error == nil {
+            Text("暂无评论").font(Theme.body()).foregroundStyle(Theme.text2)
+          }
+          if loading { ProgressView().controlSize(.small) }
+        }
+        .padding(16)
+      }
+      .spotifyScrollbar()
+    }
+    .padding(16)
+    .background(Theme.bg)
+    .preferredColorScheme(.dark)
+    .task { await load(more: false) }
+    .onChange(of: kind) { _, _ in Task { await load(more: false) } }
+  }
+
+  private func load(more: Bool) async {
+    loading = true
+    defer { loading = false }
+    error = nil
+    let target = more ? page + 1 : 1
+    do {
+      let r = try await AnyListenResource.musicComment(
+        source: music.source, music: music, type: kind.rawValue, page: target, limit: 20
+      )
+      page = target
+      total = r.total
+      items = more ? items + r.list : r.list
+    } catch let e {
+      error = e.localizedDescription
+      if !more { items = [] }
+    }
   }
 }

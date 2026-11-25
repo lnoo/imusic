@@ -44,6 +44,22 @@ enum SourceRegistry {
     }
   }
 
+  /// GD音乐台平台的统一能力构造（对标 gdstudio 的 gd-* 资源贡献）
+  private static func gdCapability(id: String, name: String, image: String, order: Int,
+                                   source: MusicSource) -> SourceCapability {
+    SourceCapability(
+      id: id, displayName: name, systemImage: image, sortOrder: order,
+      supportQualitys: MusicQuality.highToLow,
+      search: searchVia(source),
+      board: nil,
+      lyric: { try await AnyListenResource.musicLyric(source: source, music: $0) },
+      pic: { await AnyListenResource.musicPic(source: source, music: $0) },
+      fallbackUrl: { music, quality in
+        await AnyListenResource.musicUrl(source: source, music: music, quality: quality)
+      }
+    )
+  }
+
   private static func buildBuiltins() -> [SourceCapability] {
     [
       SourceCapability(
@@ -97,6 +113,18 @@ enum SourceRegistry {
         pic: { await AnyListenResource.musicPic(source: .mg, music: $0) },
         fallbackUrl: nil // mg 无公开直链（对标 any-listen：由 LX 自定义源提供）
       ),
+      // GD音乐台扩展提供的额外平台（extensions/gdstudio/src/identity.ts）
+      // 对标 gdstudio 的 gd-* 资源：musicSearch / musicUrl / musicPic / musicLyric（无榜单动作）
+      gdCapability(id: "gd-netease", name: "网易云音乐·GD", image: "cloud", order: 7, source: .gdNetease),
+      gdCapability(id: "gd-kuwo", name: "酷我音乐·GD", image: "music.note", order: 8, source: .gdKuwo),
+      gdCapability(id: "gd-tencent", name: "QQ音乐·GD", image: "play.circle", order: 9, source: .gdTencent),
+      gdCapability(id: "gd-joox", name: "JOOX", image: "music.note", order: 10, source: .gdJoox),
+      gdCapability(id: "gd-tidal", name: "TIDAL", image: "music.note", order: 11, source: .gdTidal),
+      gdCapability(id: "gd-qobuz", name: "QOBUZ", image: "music.note", order: 12, source: .gdQobuz),
+      gdCapability(id: "gd-bilibili", name: "哔哩哔哩", image: "tv", order: 13, source: .gdBilibili),
+      gdCapability(id: "gd-apple", name: "Apple Music", image: "music.note", order: 14, source: .gdApple),
+      gdCapability(id: "gd-ytmusic", name: "YouTube Music", image: "play.rectangle", order: 15, source: .gdYtmusic),
+      gdCapability(id: "gd-spotify", name: "Spotify", image: "music.note", order: 16, source: .gdSpotify),
       SourceCapability(
         id: "local", displayName: "本地", systemImage: "internaldrive", sortOrder: 99,
         supportQualitys: []

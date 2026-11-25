@@ -2,24 +2,54 @@ import Foundation
 
 // MARK: - 咪咕解析（AnyListenMg）
 //
-// 按 any-listen 契约实现的咪咕源资源动作（端点已逐个实测）：
+// 行为对齐 extensions/online-metadata/src/onlineResource/mg/*（只读参考实现）：
 //   musicSearch   jadeite.migu.cn/music_search/v3/search/searchAll（md5 签名，
 //                 audioFormats 四档音质段；img1/2/3 封面）
 //   topSongs      app.c.nf.migu.cn querycontentbyId（尖叫热歌榜 columnId 参数化）
-//   lyric         搜索/榜单条目自带 lrcUrl（d.musicapp.migu.cn 明文 LRC 直链）
-//   pic           条目自带 img1/2/3（相对路径补 d.musicapp.migu.cn 前缀）
-//   歌单           咪咕歌单公开端点已全部下线（同 GD音乐台亦无）→ 返回空，能力降级
-//   url           无公开直链（对标 any-listen：mg 直链由 LX 自定义源脚本提供）
+//   歌单           标签/浏览/详情/搜索均保留（见 mg/songlist.ts）
+//   url           无公开直链（见 extensions/online-metadata/src/onlineResource/mg/）
+//
+// 说明：Swift 侧走更简单的本地路径——歌词直接取条目 lrcUrl/trcUrl，封面直接取条目
+//       img1/2/3（相对路径补 d.musicapp.migu.cn 前缀）。扩展另有 musicDetail 资源
+//       接口、MRC 逐字歌词与动态封面获取，这些子系统不在本文件对齐范围内。
 
 enum AnyListenMg {
   private static let deviceId = "963B7AA0D21511ED807EE5846EC87D20"
+
+  /// 严格 percent-encode（RFC 3986 unreserved：字母数字 + `-._~`）。
+  /// `.urlQueryAllowed` 会保留 `&`、`=`、`?` 等字符，关键词含这些字符时会被拆成查询参数。
+  private static func queryEncode(_ text: String) -> String {
+    var allowed = CharacterSet.alphanumerics
+    allowed.insert(charactersIn: "-._~")
+    return text.addingPercentEncoding(withAllowedCharacters: allowed) ?? text
+  }
+
+  /// dateFormat(columnUpdateTime, 'Y-M-D')（extensions/online-metadata src/shared/common.ts）
+  private static func formatYMD(_ value: Any?) -> String? {
+    let raw = ALHttp.str(value)
+    guard !raw.isEmpty else { return nil }
+    let trimmed = raw.contains("T") ? raw : String(raw.split(separator: ".").first ?? Substring(raw))
+    let parser = DateFormatter()
+    parser.locale = Locale(identifier: "en_US_POSIX")
+    for fmt in ["yyyy-MM-dd HH:mm:ss", "yyyy/MM/dd HH:mm:ss", "yyyy-MM-dd'T'HH:mm:ssZ", "yyyy-MM-dd"] {
+      parser.dateFormat = fmt
+      if let d = parser.date(from: trimmed) {
+        let out = DateFormatter()
+        out.locale = Locale(identifier: "en_US_POSIX")
+        out.dateFormat = "yyyy-MM-dd"
+        return out.string(from: d)
+      }
+    }
+    let prefix = String(trimmed.prefix(10))
+    return prefix.count == 10 ? prefix : nil
+  }
 
   // MARK: 搜索（jadeite 签名搜索）
 
   static func musicSearch(keyword: String, page: Int, limit: Int) async throws -> ALListResult<MusicInfo> {
     let time = "\(Int(Date().timeIntervalSince1970 * 1000))"
     let sig = iMusicSign.mgSign(time: time, keyword: keyword)
-    let q = keyword.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? keyword
+    let q = queryEncode(keyword)
     let url = "https://jadeite.migu.cn/music_search/v3/search/searchAll?isCorrect=0&isCopyright=1&searchSwitch=%7B%22song%22%3A1%2C%22album%22%3A0%2C%22singer%22%3A0%2C%22tagSong%22%3A1%2C%22mvSong%22%3A0%2C%22bestShow%22%3A1%2C%22songlist%22%3A0%2C%22lyricSong%22%3A0%7D&pageSize=\(limit)&text=\(q)&pageNo=\(page)&sort=0&sid=USS"
     let json = try await ALHttp.getJSON(url, headers: [
       "uiVersion": "A_music_3.6.1", "deviceId": sig.deviceId, "timestamp": time, "sign": sig.sign,
@@ -34,25 +64,29 @@ enum AnyListenMg {
     var seen = Set<String>()
     for group in sr["resultList"] as? [[[String: Any]]] ?? [] {
       for d in group {
-        guard let sid = d["songId"] as? String, let cid = d["copyrightId"] as? String,
-              seen.insert(cid).inserted else { continue }
-        out.append(mapSearchItem(d, songId: sid, copyrightId: cid))
+        // 扩展 buildMusicInfoListV5：无 songId 跳过，并按 songId 去重（非 copyrightId）
+        guard let sid = d["songId"] as? String, !sid.isEmpty,
+              seen.insert(sid).inserted else { continue }
+        out.append(mapSearchItem(d, songId: sid, copyrightId: ALHttp.str(d["copyrightId"])))
       }
     }
     let total = ALHttp.int(sr["totalCount"]) ?? out.count
     return ALListResult(list: out, total: total, page: page, limit: limit)
   }
 
-  /// jadeite 搜索条目 → MusicInfo（img1/2/3 + audioFormats 音质 + lrcUrl）
+  /// jadeite 搜索条目 → MusicInfo（img1/2/3 + audioFormats 音质 + lrcUrl/mrcUrl）
   static func mapSearchItem(_ d: [String: Any], songId: String, copyrightId: String) -> MusicInfo {
     var quals: [MusicQualityType] = []
     for t in (d["audioFormats"] as? [[String: Any]] ?? []) {
-      let size = iMusicSign.size(t["asize"] ?? t["isize"])
+      // 扩展 setQuality：rawSize 为 0/缺失时跳过该档音质；取值 isize ?? asize
+      let rawSize = t["isize"] ?? t["asize"]
+      guard (ALHttp.int(rawSize) ?? 0) > 0 else { continue }
+      let size = ALFormat.sizeFormate(rawSize)
       switch t["formatType"] as? String {
       case "PQ": quals.append(.init(type: .q128k, size: size))
       case "HQ": quals.append(.init(type: .q320k, size: size))
       case "SQ": quals.append(.init(type: .flac, size: size))
-      case "ZQ24": quals.append(.init(type: .flac24bit, size: size))
+      case "ZQ", "ZQ24": quals.append(.init(type: .flac24bit, size: size))
       default: break
       }
     }
@@ -60,21 +94,23 @@ enum AnyListenMg {
     if img.isEmpty { img = ALHttp.str(d["img1"]) }
     if !img.isEmpty && !img.hasPrefix("http") { img = "http://d.musicapp.migu.cn" + img }
     let singers: String = {
-      if let arr = d["singerList"] as? [[String: Any]] { return iMusicSign.singerNames(arr) }
-      if let arr = d["singerList"] as? [String] { return arr.joined(separator: "、") }
-      return ALHttp.str(d["singer"])
+      if let arr = d["singerList"] as? [[String: Any]] { return ALFormat.singerName(arr, key: "name") }
+      if let arr = d["singerList"] as? [String] { return ALFormat.decodeName(arr.joined(separator: "、")) }
+      return ALFormat.decodeName(ALHttp.str(d["singer"]))
     }()
     let secs = ALHttp.int(d["duration"]) ?? 0
     let lrcUrl = ALHttp.str(d["lrcUrl"])
     return MusicInfo(
-      name: ALHttp.str(d["name"]), singer: singers,
+      name: ALFormat.decodeName(ALHttp.str(d["songName"])), singer: singers,
       source: .mg, songmid: songId,
-      albumName: ALHttp.str(d["album"]),
-      interval: iMusicSign.mmss(secs),
-      qualitys: quals.isEmpty ? [.init(type: .q128k, size: nil)] : quals,
+      albumName: ALFormat.decodeName(ALHttp.str(d["album"])),
+      interval: ALFormat.playTime(secs),
+      qualitys: quals,
       picUrl: img.isEmpty ? nil : img,
       extra: ["copyrightId": copyrightId, "albumId": ALHttp.str(d["albumId"]),
-              "lrcUrl": lrcUrl, "trcUrl": ALHttp.str(d["trcUrl"]), "intervalSecs": "\(secs)"]
+              "contentId": ALHttp.str(d["contentId"]),
+              "lrcUrl": lrcUrl, "mrcUrl": ALHttp.str(d["mrcUrl"]),
+              "trcUrl": ALHttp.str(d["trcUrl"]), "intervalSecs": "\(secs)"]
     )
   }
 
@@ -142,12 +178,19 @@ enum AnyListenMg {
             seen.insert(sid).inserted else { continue }
       guard let m = mapBoardSong(o, songId: sid) else { continue }
       out.append(m)
-      if limit > 0, out.count >= limit { break }
     }
+    // 扩展 getList：info 由 columnInfo 全量映射（date 经 dateFormat 'Y-M-D'）
+    let pic = ALHttp.str(columnInfo["columnSmallpicUrl"])
+    let desc = ALHttp.str(columnInfo["columnDes"])
     let info = ALTopSongsDetailInfo(
-      name: ALHttp.str(columnInfo["columnTitle"]),
-      pic: nil, desc: nil, date: ALHttp.str(columnInfo["columnUpdateTime"]))
-    return ALTopSongsDetailResult(list: out, total: out.count, page: page, limit: limit, info: info)
+      name: ALFormat.decodeName(ALHttp.str(columnInfo["columnTitle"])),
+      pic: pic.isEmpty ? nil : pic,
+      desc: desc.isEmpty ? nil : desc,
+      date: Self.formatYMD(columnInfo["columnUpdateTime"]))
+    // 扩展不在客户端按 page/limit 切片：total/limit 均为 contentsCount
+    let contentsCount = ALHttp.int(columnInfo["contentsCount"]) ?? out.count
+    return ALTopSongsDetailResult(list: out, total: contentsCount, page: page,
+                                  limit: contentsCount, info: info)
   }
 
   /// querycontentbyId 条目（newRateFormats 音质 + albumImgs 封面 + lrcUrl）
@@ -155,7 +198,10 @@ enum AnyListenMg {
     guard let cid = o["copyrightId"] as? String else { return nil }
     var quals: [MusicQualityType] = []
     for t in (o["newRateFormats"] as? [[String: Any]] ?? []) {
-      let size = iMusicSign.size(t["size"] ?? t["androidSize"])
+      // 扩展 buildMusicInfoList：setQuality 跳过 rawSize 为 0/缺失档
+      let rawSize = t["size"] ?? t["androidSize"]
+      guard (ALHttp.int(rawSize) ?? 0) > 0 else { continue }
+      let size = ALFormat.sizeFormate(rawSize)
       switch t["formatType"] as? String {
       case "PQ": quals.append(.init(type: .q128k, size: size))
       case "HQ": quals.append(.init(type: .q320k, size: size))
@@ -164,7 +210,8 @@ enum AnyListenMg {
       default: break
       }
     }
-    let singers = (o["artists"] as? [[String: Any]]).map(iMusicSign.singerNames) ?? ALHttp.str(o["singer"])
+    let singers = (o["artists"] as? [[String: Any]]).map { ALFormat.singerName($0, key: "name") }
+      ?? ALFormat.decodeName(ALHttp.str(o["singer"]))
     var img = ((o["albumImgs"] as? [[String: Any]])?.first?["img"] as? String) ?? ""
     if !img.isEmpty && !img.hasPrefix("http") { img = "http://d.musicapp.migu.cn" + img }
     // length 形如 "03:45"（对标 filterMusicInfoList 取尾部）
@@ -176,14 +223,16 @@ enum AnyListenMg {
     }
     let lrcUrl = ALHttp.str(o["lrcUrl"])
     return MusicInfo(
-      name: ALHttp.str(o["songName"]), singer: singers,
+      name: ALFormat.decodeName(ALHttp.str(o["songName"])), singer: singers,
       source: .mg, songmid: songId,
-      albumName: ALHttp.str(o["album"]),
+      albumName: ALFormat.decodeName(ALHttp.str(o["album"])),
       interval: interval,
       qualitys: quals.isEmpty ? [.init(type: .q128k, size: nil)] : quals,
       picUrl: img.isEmpty ? nil : img,
       extra: ["copyrightId": cid, "albumId": ALHttp.str(o["albumId"]),
-              "lrcUrl": lrcUrl, "trcUrl": ALHttp.str(o["trcUrl"]), "intervalSecs": ""]
+              "contentId": ALHttp.str(o["contentId"]),
+              "lrcUrl": lrcUrl, "mrcUrl": ALHttp.str(o["mrcUrl"]),
+              "trcUrl": ALHttp.str(o["trcUrl"]), "intervalSecs": ""]
     )
   }
 
@@ -203,16 +252,16 @@ enum AnyListenMg {
     let hotTags = ((firstGroup["content"] as? [[String: Any]]) ?? []).compactMap { c -> ALTagItem? in
       guard let texts = c["texts"] as? [Any], texts.count >= 2,
             let name = texts[0] as? String, let id = texts[1] as? String, !name.isEmpty, !id.isEmpty else { return nil }
-      return ALTagItem(id: id, name: name)
+      return ALTagItem(id: id, name: ALFormat.decodeName(name))
     }
     // 其余组 → 分组标签
     var groups: [ALTagGroupItem] = []
     for g in data.dropFirst() {
-      let header = (g["header"] as? [String: Any])?["title"] as? String ?? ""
+      let header = ALFormat.decodeName((g["header"] as? [String: Any])?["title"] as? String ?? "")
       let list = ((g["content"] as? [[String: Any]]) ?? []).compactMap { c -> ALTagItem? in
         guard let texts = c["texts"] as? [Any], texts.count >= 2,
               let name = texts[0] as? String, let id = texts[1] as? String, !name.isEmpty, !id.isEmpty else { return nil }
-        return ALTagItem(id: id, name: name)
+        return ALTagItem(id: id, name: ALFormat.decodeName(name))
       }
       if !list.isEmpty { groups.append(ALTagGroupItem(name: header, list: list)) }
     }
@@ -244,7 +293,7 @@ enum AnyListenMg {
         let logEvent = it["logEvent"] as? [String: Any] ?? [:]
         let barList = it["barList"] as? [[String: Any]] ?? []
         return ALSongListItem(id: ALHttp.str(logEvent["contentId"]),
-                              name: ALHttp.str(it["title"]),
+                              name: ALFormat.decodeName(ALHttp.str(it["title"])),
                               playCount: barList.first?["title"] as? String,
                               img: it["imageUrl"] as? String)
       }
@@ -267,8 +316,10 @@ enum AnyListenMg {
         guard (item["resType"] as? String) == "2021",
               let rid = item["resId"] as? String, !seen.contains(rid) else { continue }
         seen.insert(rid)
-        out.append(ALSongListItem(id: rid, name: ALHttp.str(item["txt"]).isEmpty ? "Unknown" : ALHttp.str(item["txt"]),
-                                  img: item["img"] as? String, desc: item["txt2"] as? String))
+        let txt = ALFormat.decodeName(ALHttp.str(item["txt"]))
+        out.append(ALSongListItem(id: rid, name: txt.isEmpty ? "Unknown" : txt,
+                                  img: item["img"] as? String,
+                                  desc: (item["txt2"] as? String).map { ALFormat.decodeName($0) }))
       }
     }
     walk(contents)
@@ -279,7 +330,7 @@ enum AnyListenMg {
   static func songlistSearch(keyword: String, page: Int, limit: Int) async throws -> ALListResult<ALSongListItem> {
     let time = "\(Int(Date().timeIntervalSince1970 * 1000))"
     let sig = iMusicSign.mgSign(time: time, keyword: keyword)
-    let q = keyword.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? keyword
+    let q = queryEncode(keyword)
     let url = "https://jadeite.migu.cn/music_search/v3/search/searchAll?isCorrect=1&isCopyright=1&searchSwitch=%7B%22song%22%3A0%2C%22album%22%3A0%2C%22singer%22%3A0%2C%22tagSong%22%3A0%2C%22mvSong%22%3A0%2C%22bestShow%22%3A0%2C%22songlist%22%3A1%2C%22lyricSong%22%3A0%7D&pageSize=\(limit)&text=\(q)&pageNo=\(page)&sort=0&sid=USS"
     let json = try await ALHttp.getJSON(url, headers: [
       "uiVersion": "A_music_3.6.1", "deviceId": sig.deviceId, "timestamp": time, "sign": sig.sign,
@@ -292,12 +343,15 @@ enum AnyListenMg {
     }
     let total = ALHttp.int(songlistData["totalCount"]) ?? 0
     let list = ((songlistData["result"] as? [[String: Any]]) ?? []).map { item in
-      ALSongListItem(id: ALHttp.str(item["id"]), name: ALHttp.str(item["name"]),
-                     playCount: ALNormalize.playCount(ALHttp.int(item["playNum"]) ?? 0),
-                     author: item["userName"] as? String, time: "",
-                     img: item["musicListPicUrl"] as? String,
-                     desc: ALHttp.str(item["intro"]).isEmpty ? nil : ALHttp.str(item["intro"]),
-                     total: ALHttp.int(item["musicNum"]) ?? 0)
+      let intro = ALFormat.decodeName(ALHttp.str(item["intro"]))
+      let author = (item["userName"] as? String).map { ALFormat.decodeName($0) }
+      return ALSongListItem(id: ALHttp.str(item["id"]),
+                            name: ALFormat.decodeName(ALHttp.str(item["name"])),
+                            playCount: ALFormat.playCount(ALHttp.int(item["playNum"]) ?? 0),
+                            author: author, time: "",
+                            img: item["musicListPicUrl"] as? String,
+                            desc: intro.isEmpty ? nil : intro,
+                            total: ALHttp.int(item["musicNum"]) ?? 0)
     }
     return ALListResult(list: list, total: total, page: page, limit: limit)
   }
@@ -321,12 +375,14 @@ enum AnyListenMg {
     let total = ALHttp.int(songData["totalCount"]) ?? list.count
     let opNum = (infoData["opNumItem"] as? [String: Any]) ?? [:]
     let imgItem = (infoData["imgItem"] as? [String: Any]) ?? [:]
+    let summary = (infoData["summary"] as? String).map { ALFormat.decodeName($0) }
+    let owner = (infoData["ownerName"] as? String).map { ALFormat.decodeName($0) }
     let info = ALSongListDetailInfo(
-      name: ALHttp.str(infoData["title"]),
+      name: ALFormat.decodeName(ALHttp.str(infoData["title"])),
       img: imgItem["img"] as? String,
-      desc: infoData["summary"] as? String,
-      author: infoData["ownerName"] as? String,
-      playCount: ALNormalize.playCount(ALHttp.int(opNum["playNum"]) ?? 0),
+      desc: summary,
+      author: owner,
+      playCount: ALFormat.playCount(ALHttp.int(opNum["playNum"]) ?? 0),
       date: nil)
     return ALSonglistDetailResult(list: list, total: total, page: page, limit: limit, info: info)
   }
@@ -339,7 +395,9 @@ enum AnyListenMg {
       guard let sid = item["songId"] as? String, !sid.isEmpty, seen.insert(sid).inserted else { continue }
       var quals: [MusicQualityType] = []
       for t in (item["audioFormats"] as? [[String: Any]] ?? []) {
-        let size = iMusicSign.size(t["isize"] ?? t["asize"])
+        let rawSize = t["isize"] ?? t["asize"]
+        guard (ALHttp.int(rawSize) ?? 0) > 0 else { continue }
+        let size = ALFormat.sizeFormate(rawSize)
         switch t["formatType"] as? String {
         case "PQ": quals.append(.init(type: .q128k, size: size))
         case "HQ": quals.append(.init(type: .q320k, size: size))
@@ -352,21 +410,23 @@ enum AnyListenMg {
       if img.isEmpty { img = ALHttp.str(item["img1"]) }
       if !img.isEmpty && !img.hasPrefix("http") { img = "http://d.musicapp.migu.cn" + img }
       let singers: String = {
-        if let arr = item["singerList"] as? [[String: Any]] { return iMusicSign.singerNames(arr) }
-        if let arr = item["singerList"] as? [String] { return arr.joined(separator: "、") }
-        return ALHttp.str(item["singer"])
+        if let arr = item["singerList"] as? [[String: Any]] { return ALFormat.singerName(arr, key: "name") }
+        if let arr = item["singerList"] as? [String] { return ALFormat.decodeName(arr.joined(separator: "、")) }
+        return ALFormat.decodeName(ALHttp.str(item["singer"]))
       }()
       let secs = ALHttp.int(item["duration"]) ?? 0
       out.append(MusicInfo(
-        name: ALHttp.str(item["songName"]), singer: singers,
+        name: ALFormat.decodeName(ALHttp.str(item["songName"])), singer: singers,
         source: .mg, songmid: sid,
-        albumName: ALHttp.str(item["album"]),
+        albumName: ALFormat.decodeName(ALHttp.str(item["album"])),
         interval: secs > 0 ? iMusicSign.mmss(secs) : nil,
         qualitys: quals.isEmpty ? [.init(type: .q128k, size: nil)] : quals,
         picUrl: img.isEmpty ? nil : img,
         extra: ["copyrightId": ALHttp.str(item["copyrightId"]),
                 "albumId": ALHttp.str(item["albumId"]),
-                "lrcUrl": ALHttp.str(item["lrcUrl"]), "trcUrl": ALHttp.str(item["trcUrl"]),
+                "contentId": ALHttp.str(item["contentId"]),
+                "lrcUrl": ALHttp.str(item["lrcUrl"]), "mrcUrl": ALHttp.str(item["mrcUrl"]),
+                "trcUrl": ALHttp.str(item["trcUrl"]),
                 "intervalSecs": "\(secs)"]))
     }
     return out
@@ -399,7 +459,7 @@ enum AnyListenMg {
     music.picUrl
   }
 
-  // MARK: 播放直链（mg 无公开直链；对标 any-listen 由 LX 自定义源提供）
+  // MARK: 播放直链（mg 无公开直链；见 extensions/online-metadata/src/onlineResource/mg/）
 
   static func musicUrl(_ music: MusicInfo, chain: [Int]) async -> ALMusicUrlInfo? { nil }
 
@@ -408,12 +468,13 @@ enum AnyListenMg {
   static func hotSearch() async throws -> [String] {
     let json = try await ALHttp.getJSON(
       "http://jadeite.migu.cn:7090/music_search/v3/search/hotword") as? [String: Any]
-    guard (json?["code"] as? String) == "000000",
-          let data = json?["data"] as? [String: Any],
-          let hotwords = data["hotwords"] as? [[String: Any]],
-          let list = hotwords.first?["hotwordList"] as? [[String: Any]] else {
+    guard (json?["code"] as? String) == "000000" else {
       throw ALSourceError.invalidResponse("咪咕热词失败")
     }
+    // 扩展 filterList(body.data.hotwords[0]?.hotwordList ?? [])：数据缺失时返回空列表
+    let data = json?["data"] as? [String: Any]
+    let hotwords = data?["hotwords"] as? [[String: Any]]
+    let list = hotwords?.first?["hotwordList"] as? [[String: Any]] ?? []
     return list.filter { ($0["resourceType"] as? String) == "song" }
       .compactMap { $0["word"] as? String }
   }
@@ -421,7 +482,7 @@ enum AnyListenMg {
   // MARK: 搜索提示（tone_search_suggest；原生迁移自 online-metadata mg/tipSearch）
 
   static func tipSearch(keyword: String) async throws -> [String] {
-    let q = keyword.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? keyword
+    let q = queryEncode(keyword)
     let json = try await ALHttp.getJSON(
       "https://app.u.nf.migu.cn/pc/resource/content/tone_search_suggest/v1.0?text=\(q)",
       headers: ["User-Agent": "MGMobileMusic/7.33.0 (iPhone; iOS 16.6; Scale/3.00)", "channel": "0146921"]) as? [String: Any]

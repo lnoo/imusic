@@ -2,7 +2,7 @@
 
 macOS 原生客户端，采用 **Spotify 深色设计语言（Encore 风格）** 打造，
 **音源底层解析严格对齐 `any-listen` 的资源动作契约与数据模型**（搜索/歌单/榜单/歌词/封面），
-自定义源脚本（LX 音源）通道保持 `lx-music` 系兼容。
+自定义源脚本通道对标 `extensions/lx-api-source-loader`（LX 脚本协议兼容），并支持导入 `sources.json` 音源清单。
 标准 Xcode macOS App 工程（macOS 27+，Swift 6）。
 
 ```bash

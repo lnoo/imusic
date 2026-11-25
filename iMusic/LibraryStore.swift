@@ -29,8 +29,6 @@ final class LibraryStore {
   private struct Root: Codable {
     var playlists: [Playlist]
     var history: [MusicInfo]
-    /// 「我喜欢」最新在前的一次性迁移标记：旧数据按添加先后正序存储，读入时反转为最新在前
-    var favNewestFirst: Bool?
   }
   private var file: URL { dir.appendingPathComponent("library.json") }
 
@@ -42,15 +40,10 @@ final class LibraryStore {
     }
     playlists = r.playlists.isEmpty ? [Playlist(id: "fav", name: "我喜欢", songs: [])] : r.playlists
     history = r.history
-    // 一次性迁移：旧版「我喜欢」最早添加在前，反转为最新在前（此后 add 固定插到顶部）
-    if r.favNewestFirst != true, let i = playlists.firstIndex(where: { $0.id == "fav" }) {
-      playlists[i].songs.reverse()
-      save()
-    }
   }
 
   private func save() {
-    let r = Root(playlists: playlists, history: Array(history.prefix(100)), favNewestFirst: true)
+    let r = Root(playlists: playlists, history: Array(history.prefix(100)))
     if let d = try? JSONEncoder().encode(r) { try? d.write(to: file) }
   }
 

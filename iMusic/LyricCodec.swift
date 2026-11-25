@@ -6,12 +6,12 @@ import Compression
 // kg KRC：lyrics.kugou.com download?fmt=krc → base64 → 头 4 字节 "krc1" +
 //         循环 XOR（key = "@Gaw^2tGQ61-ÎÊni"，即 [64,71,97,119,94,50,116,71,
 //         81,54,49,45,206,210,110,105]）→ zlib inflate → KRC/逐字歌词。
-//         （参考 CGQAQ/krc-rs、lx-music 系 decodeKrc）
+//         对齐 extensions/online-metadata/src/onlineResource/kg/utils.ts decodeKrc
 //
 // tx QRC：u.y.qq.com GetPlayLyricInfo → lyric 为 hex(QRC密文) →
 //         pyqdes 三段式（ddes KEY1 → des KEY2 → ddes KEY3）→ zlib inflate →
-//         XML 包裹的逐字歌词（参考 TLittlePrince/qrcDecrypt，
-//         算法源自 qq49371114/lx-music-api-server 的 pyqdes）。
+//         XML 包裹的逐字歌词。对齐 extensions/online-metadata/src/onlineResource/tx/qrcDecode.ts
+//         与 lyric.ts 的解析部分。
 //
 // 二者均为公开社区早已广泛流传的格式，仅用于正常展示歌词。
 
@@ -62,7 +62,7 @@ enum LyricCodec {
     return lines.joined(separator: "\n")
   }
 
-  // MARK: QRC（QQ音乐逐字歌词，pyqdes）
+  // MARK: QRC（QQ音乐逐字歌词；对齐 online-metadata tx/qrcDecode.ts）
 
   static func decodeQRC(_ encoded: String) -> String? {
     var cipher: [UInt8]
@@ -137,9 +137,9 @@ enum LyricCodec {
   }
 }
 
-// MARK: - pyqdes（QQ QRC 三重自定义 DES）
+// MARK: - QQ QRC 三重自定义 DES（对齐 online-metadata tx/qrcDecode.ts）
 
-/// 端口自 pyqdes（QQ 音乐 QRC 逆向实现，Python/Cpp 版社区公开）。
+/// 与 extensions/online-metadata/src/onlineResource/tx/qrcDecode.ts 同款 3DES-ECB + zlib 实现。
 /// 所有位运算按 Python 无符号语义用 UInt32/UInt8 复刻。
 enum QrcDes {
   private static let sBox1: [UInt8] = [

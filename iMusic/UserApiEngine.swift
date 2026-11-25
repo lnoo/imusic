@@ -13,19 +13,18 @@ import Compression
 
 @Observable @MainActor
 final class UserApiEngine {
+  /// 是否有任意脚本成功初始化（UI 据此判断是否走自定义源）
   var inited = false
   var message = "未加载"
+  /// 按优先级聚合后的能力表：靠前脚本先声明的 action/quality 优先
   var sources: [String: UserApiSourceInfo] = [:]
   var qualitys: [String: [MusicQuality]] = [:]
 
-  private var ctx: JSContext?
-  private var requestHandler: JSValue?
-  private var pending: [String: CheckedContinuation<JSValue, Error>] = [:]
-  private var tasks: [String: URLSessionDataTask] = [:]
-  private var meta: SourceScriptMeta = SourceScriptMeta(name: "", description: "", author: "", homepage: "", version: "")
-  private var rawScript = ""
+  /// 有序脚本上下文（数组顺序 = 优先级，对标 config.ts enabledScripts 勾选顺序）
+  private var scripts: [ScriptContext] = []
+
   /// 代理（对标 setting network.proxy + preload getRequestAgent；host 为空即直连）
-  private var netSession: URLSession = .shared
+  fileprivate var netSession: URLSession = .shared
 
   func applyProxy(host: String, port: Int) {
     UserDefaults.standard.set(host, forKey: "proxy.host")
@@ -42,7 +41,203 @@ final class UserApiEngine {
                port: UserDefaults.standard.integer(forKey: "proxy.port"))
   }
 
-  // 与 preload.js 完全一致的过滤表
+  var onUpdateAlert: ((UpdateAlert) -> Void)?
+
+  /// 音质降级链（低 -> 高），对齐 isolate/index.ts:141 的 `types`（全部 8 档）
+  static let qualityLadder: [MusicQuality] = [
+    .q128k, .q192k, .q320k, .wav, .flac, .flac24bit, .dolby, .master,
+  ]
+
+  // MARK: - 可选代理 URL 包装（对齐 onlineResource/index.ts:5-12 的 musicUtils.createProxyUrl）
+
+  /// 代理基址。默认 nil = 关闭（不强制包装），设置后 musicUrl 结果会经 `createProxyURL` 包装。
+  /// 本类为 @MainActor，静态存储属性继承 MainActor 隔离，无跨线程数据竞争（非 Sendable 全局）。
+  static var proxyBaseURL: String? = nil
+
+  /// setter：传入 nil / 空字符串即恢复默认关闭。
+  static func setProxyBaseURL(_ base: String?) {
+    proxyBaseURL = base
+  }
+
+  /// 对标 any-listen proxyServer.createProxy + buildVirtualPublicPath：
+  /// 结果形如 `<base>/<sha256(url)><ext>`（base 以 '/' 开头时加 `al-ps-host:` 前缀）。
+  /// 未配置代理、或非 http(s) URL 时原样返回（行为可用但不强制开启）。
+  static func createProxyURL(_ raw: String) -> String {
+    guard let base = proxyBaseURL, !base.isEmpty,
+          let url = URL(string: raw), ["http", "https"].contains(url.scheme?.lowercased() ?? "") else { return raw }
+    let ext = url.pathExtension.isEmpty ? "" : "." + url.pathExtension
+    let name = SHA256.hash(data: Data(raw.utf8)).map { String(format: "%02x", $0) }.joined() + ext
+    let prefix = base.hasPrefix("/") ? "al-ps-host:" : ""
+    let sep = base.hasSuffix("/") ? "" : "/"
+    return prefix + base + sep + name
+  }
+
+  struct ScriptSpec {
+    var id: String
+    var scriptRaw: String
+    var meta: SourceScriptMeta
+  }
+
+  // MARK: - load / unload
+
+  /// 按序加载全部启用脚本（src/main/index.ts:9-38）。
+  /// 单个脚本失败不阻断其他脚本；能力按脚本优先级聚合。
+  func loadAll(_ specs: [ScriptSpec]) async {
+    unload()
+    guard !specs.isEmpty else {
+      message = "当前为内置模式（无启用自定义源）"
+      aggregate()
+      return
+    }
+    var loaded: [ScriptContext] = []
+    var failures: [String] = []
+    for spec in specs {
+      let context = ScriptContext(id: spec.id, owner: self, meta: spec.meta, rawScript: spec.scriptRaw)
+      do {
+        try await context.load()
+        loaded.append(context)
+      } catch {
+        failures.append("\(spec.meta.name)：\(error.localizedDescription)")
+        context.unload()
+      }
+    }
+    scripts = loaded
+    aggregate()
+    inited = !loaded.isEmpty
+    if loaded.isEmpty {
+      message = "源加载失败：\(failures.prefix(2).joined(separator: "；"))"
+    } else {
+      message = "已加载 \(loaded.count) 个源：\(loaded.map(\.message).joined(separator: "；"))"
+        + (failures.isEmpty ? "" : "（另有 \(failures.count) 个失败）")
+    }
+  }
+
+  func unload() {
+    for context in scripts { context.unload() }
+    scripts.removeAll()
+    inited = false
+    sources = [:]
+    qualitys = [:]
+  }
+
+  /// 单个脚本初始化后声明的能力（供 AppState 回写 UserApiInfo.sources）
+  func sources(forScript id: String) -> [String: UserApiSourceInfo] {
+    scripts.first { $0.id == id }?.sources ?? [:]
+  }
+
+  /// 按优先级合并各脚本声明的 source -> actions/qualitys（相同项靠前者胜）
+  private func aggregate() {
+    var acts: [String: [UserApiAction]] = [:]
+    var quals: [String: [MusicQuality]] = [:]
+    for script in scripts where script.inited {
+      for (source, info) in script.sources {
+        var a = acts[source] ?? []
+        for action in info.actions where !a.contains(action) { a.append(action) }
+        acts[source] = a
+        var q = quals[source] ?? []
+        for quality in info.qualitys where !q.contains(quality) { q.append(quality) }
+        quals[source] = q
+      }
+    }
+    var merged: [String: UserApiSourceInfo] = [:]
+    for (source, actions) in acts {
+      merged[source] = UserApiSourceInfo(type: "music", actions: actions, qualitys: quals[source] ?? [])
+    }
+    sources = merged
+    qualitys = merged.mapValues { $0.qualitys }
+  }
+
+  // MARK: - 多脚本调度（isolate/index.ts:141-167）
+
+  /// 按优先级找能处理该 source+action+quality 的脚本；musicUrl 沿降级链逐级向下找。
+  private func findTarget(source: String, action: UserApiAction, quality: MusicQuality,
+                          excludeIDs: [String]) -> (script: ScriptContext, quality: MusicQuality)? {
+    let candidates = scripts.filter { $0.inited && !excludeIDs.contains($0.id) }
+    // lyric/pic 与音质无关：取首个声明该 source+action 的脚本
+    if action != .musicUrl {
+      guard let s = candidates.first(where: { $0.sources[source]?.actions.contains(action) == true }) else { return nil }
+      return (s, quality)
+    }
+    let start = Self.qualityLadder.firstIndex(of: quality) ?? Self.qualityLadder.count - 1
+    for index in stride(from: start, through: 0, by: -1) {
+      let q = Self.qualityLadder[index]
+      if let s = candidates.first(where: {
+        guard let info = $0.sources[source] else { return false }
+        return info.actions.contains(.musicUrl) && info.qualitys.contains(q)
+      }) {
+        return (s, q)
+      }
+    }
+    return nil
+  }
+
+  /// 统一入口：优先级 + 音质降级 + 失败 exclude 递归（对标 getMusicUrl）。
+  func callScript(source: String, action: UserApiAction, quality: MusicQuality,
+                  music: MusicInfo) async throws -> Any {
+    try await callScript(source: source, action: action, quality: quality, music: music, excludeIDs: [])
+  }
+
+  private func callScript(source: String, action: UserApiAction, quality: MusicQuality,
+                          music: MusicInfo, excludeIDs: [String]) async throws -> Any {
+    guard let target = findTarget(source: source, action: action, quality: quality, excludeIDs: excludeIDs) else {
+      throw NSError(domain: "LX", code: -2,
+                    userInfo: [NSLocalizedDescriptionKey: "没有可用源处理 \(source)/\(action.rawValue)（\(quality.rawValue)）"])
+    }
+    do {
+      let value = try await target.script.call(source: source, action: action, quality: target.quality, music: music)
+      if action == .musicUrl, let url = value as? String {
+        // shared/utils.ts:43-56 verifyUrl：Range: bytes=0-1 校验可达性并返回最终重定向 URL
+        let verified = try await verifyURL(url)
+        // onlineResource/index.ts:10 musicUtils.createProxyUrl(url, {}, enabledCache)
+        return Self.createProxyURL(verified)
+      }
+      return value
+    } catch {
+      // 失败脚本加入排除表，从原始请求音质重新选源（对齐 isolate/index.ts:165）
+      guard !excludeIDs.contains(target.script.id) else { throw error }
+      return try await callScript(source: source, action: action, quality: quality, music: music,
+                                  excludeIDs: excludeIDs + [target.script.id])
+    }
+  }
+
+  /// verifyUrl（shared/utils.ts:43-56）：GET + `Range: bytes=0-1`，跟随重定向，
+  /// 要求 2xx，返回最终 URL（`resp.history[resp.history.length - 1]`）。
+  private func verifyURL(_ raw: String) async throws -> String {
+    guard let url = URL(string: raw), ["http", "https"].contains(url.scheme?.lowercased() ?? "") else {
+      throw NSError(domain: "LX", code: -5, userInfo: [NSLocalizedDescriptionKey: "源返回了非法URL"])
+    }
+    let probe = URLRangeProbe()
+    return try await probe.finalURL(for: url)
+  }
+}
+
+// MARK: - 单脚本 JSContext（沙箱隔离：每脚本独立 lx/console/全局变量）
+@MainActor
+private final class ScriptContext {
+  let id: String
+  let meta: SourceScriptMeta
+  let rawScript: String
+  /// 弱引用宿主，共享代理会话与更新提示回调
+  unowned let owner: UserApiEngine
+
+  var inited = false
+  var message = "未加载"
+  var sources: [String: UserApiSourceInfo] = [:]
+  var qualitys: [String: [MusicQuality]] = [:]
+
+  private var ctx: JSContext?
+  private var requestHandler: JSValue?
+  private var pending: [String: CheckedContinuation<JSValue, Error>] = [:]
+  private var tasks: [String: URLSessionDataTask] = [:]
+  private var generation = 0
+  private var initedContinuation: CheckedContinuation<Void, Error>?
+
+  private func lxError(_ code: Int, _ msg: String) -> NSError {
+    NSError(domain: "LX", code: code, userInfo: [NSLocalizedDescriptionKey: msg])
+  }
+
+  /// 与 preload.js 一致的过滤表。注意：lyric/pic 同样允许在线源声明
+  /// （修复旧实现仅 local 可声明 lyric/pic，导致脚本歌词/封面永远不执行的缺陷）。
   private let allSources = ["kw", "kg", "tx", "wy", "mg", "local"]
   private let supportQualitys: [String: [String]] = [
     "kw": ["128k", "320k", "flac", "flac24bit"],
@@ -53,21 +248,20 @@ final class UserApiEngine {
     "local": [],
   ]
   private let supportActions: [String: [String]] = [
-    "kw": ["musicUrl"], "kg": ["musicUrl"], "tx": ["musicUrl"],
-    "wy": ["musicUrl"], "mg": ["musicUrl"], "xm": ["musicUrl"],
+    "kw": ["musicUrl", "lyric", "pic"], "kg": ["musicUrl", "lyric", "pic"],
+    "tx": ["musicUrl", "lyric", "pic"], "wy": ["musicUrl", "lyric", "pic"],
+    "mg": ["musicUrl", "lyric", "pic"], "xm": ["musicUrl", "lyric", "pic"],
     "local": ["musicUrl", "lyric", "pic"],
   ]
 
-  var onUpdateAlert: ((UpdateAlert) -> Void)?
-
-  // MARK: load
-  /// 每次 load/unload 递增；旧 JSContext 的回调用它自检，避免打进来
-  private var generation = 0
-
-  private func lxError(_ code: Int, _ msg: String) -> NSError {
-    NSError(domain: "LX", code: code, userInfo: [NSLocalizedDescriptionKey: msg])
+  init(id: String, owner: UserApiEngine, meta: SourceScriptMeta, rawScript: String) {
+    self.id = id
+    self.owner = owner
+    self.meta = meta
+    self.rawScript = rawScript
   }
 
+  // MARK: load
   /// 取走并 resume 初始化 continuation（防 double-resume / 泄漏）
   private func resumeInited(_ result: Result<Void, Error>) {
     guard let c = initedContinuation else { return }
@@ -83,11 +277,8 @@ final class UserApiEngine {
   }
 
   /// 加载并执行源脚本，等待其调用 lx.send('inited', {sources})，复刻 initEnv + handleInit
-  func load(scriptRaw: String, meta: SourceScriptMeta) async throws {
-    unload()
+  func load() async throws {
     let gen = generation
-    self.meta = meta
-    self.rawScript = scriptRaw
     message = "源初始化中…"
     inited = false; sources = [:]
 
@@ -130,11 +321,9 @@ final class UserApiEngine {
           self.resumeInited(.failure(self.lxError(-1, "源初始化超时（20s，未调用 lx.send('inited')）")))
         }
       }
-      ctx.evaluateScript(wrapped(scriptRaw))
+      ctx.evaluateScript(wrapped(rawScript))
     }
   }
-
-  private var initedContinuation: CheckedContinuation<Void, Error>?
 
   /// JavaScriptCore 的 evaluateScript 不支持顶层 await（实测报 SyntaxError），
   /// 而真实源脚本大量使用顶层 `await lx.send(...)`，故用 async IIFE 包裹执行。
@@ -215,7 +404,7 @@ final class UserApiEngine {
         req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
       }
       let key = UUID().uuidString
-      let task = self.netSession.dataTask(with: req) { data, resp, err in
+      let task = self.owner.netSession.dataTask(with: req) { data, resp, err in
         Task { @MainActor in
           self.tasks.removeValue(forKey: key)
           // 代际已变/上下文已卸载：丢弃回调，避免旧 JSValue 打进已释放的 JSContext
@@ -262,7 +451,7 @@ final class UserApiEngine {
         let url = data.forProperty("updateUrl")?.toString()
         let clean = (url?.hasPrefix("http") == true) ? (url == "undefined" ? nil : url) : nil
         let alert = UpdateAlert(name: self.meta.name, log: String(log.prefix(1024)), updateUrl: clean)
-        self.onUpdateAlert?(alert)
+        self.owner.onUpdateAlert?(alert)
         return true
       default:
         return false
@@ -416,9 +605,9 @@ final class UserApiEngine {
     resumeInited(.success(()))
   }
 
-  // MARK: - 宿主 -> 脚本 request（复刻 handleRequest + 20s超时 + 响应校验）
+  // MARK: - 宿主 -> 本脚本 request（复刻 handleRequest + 20s超时 + 响应校验）
   /// - returns: musicUrl->URL字符串；pic->URL字符串；lyric->LyricInfo
-  func callScript(source: String, action: UserApiAction, quality: MusicQuality, music: MusicInfo) async throws -> Any {
+  func call(source: String, action: UserApiAction, quality: MusicQuality, music: MusicInfo) async throws -> Any {
     guard let ctx, let handler = requestHandler else { throw lxError(-2, "源未初始化（request handler 缺失）") }
     let gen = generation
     let payload: [String: Any] = [
@@ -552,7 +741,7 @@ final class UserApiEngine {
       return try cccrypt(data: data, key: keyPadded, keyLen: keyLen, iv: ivPadded, options: CCOptions(kCCOptionPKCS7Padding))
     }
 
-    // CFB / CTR / OFB：用原始 AES 块原语手动实现（对标 lx-music utils.crypto aesEncrypt）
+    // CFB / CTR / OFB：用原始 AES 块原语手动实现（对齐 extensions/lx-api-source-loader 的 utils.crypto）
     let block = keyPadded
     if m.contains("ctr") {
       // aes-js CTR：initial counter = iv(16B)，大端自增，XOR 密钥流
@@ -578,7 +767,7 @@ final class UserApiEngine {
       return out
     }
     if m.contains("cfb") {
-      // lx-music aes-128-cfb：segment size = 16（整块）；shift register 初值 = iv
+      // aes-128-cfb：segment size = 16（整块）；shift register 初值 = iv
       var sr = ivPadded
       var out = [UInt8](repeating: 0, count: data.count)
       var i = 0
@@ -660,7 +849,7 @@ final class UserApiEngine {
     }
   }
 
-  /// 原始 RSA（RSA_NO_PADDING）：m^e mod n，左补 0 到模长。对标 lx-music rsaEncrypt
+  /// 原始 RSA（RSA_NO_PADDING）：m^e mod n，左补 0 到模长。对齐 LX 脚本沙箱 rsaEncrypt
   static func rsaEncrypt(data: [UInt8], pemKey: String) throws -> [UInt8] {
     // 解析 PKCS#1 RSAPublicKey / SubjectPublicKeyInfo（BEGIN PUBLIC KEY / RSA PUBLIC KEY）
     let base64 = pemKey
@@ -870,3 +1059,74 @@ final class UserApiEngine {
 }
 
 // zlib helpers 直接复用 SourceScriptParser.compress/decompress（internal）
+
+// MARK: - verifyUrl 探针
+/// 对齐 shared/utils.ts:43-56：
+/// - GET + `Range: bytes=0-1`，收到响应头即取消，不做完整 body 下载；
+/// - 跟随重定向（自定义 delegate 需自行实现 willPerformHTTPRedirection）；
+/// - 仅 2xx 视为成功，返回最终响应 URL 的绝对字符串（对应 `resp.history` 末项）。
+private final class URLRangeProbe: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+  private let lock = NSLock()
+  private var continuation: CheckedContinuation<String, Error>?
+
+  func finalURL(for url: URL) async throws -> String {
+    var request = URLRequest(url: url, timeoutInterval: 10)
+    request.httpMethod = "GET"
+    request.setValue("bytes=0-1", forHTTPHeaderField: "Range")
+    let session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
+    let task = session.dataTask(with: request)
+    let result: String = try await withCheckedThrowingContinuation { cont in
+      lock.lock()
+      continuation = cont
+      lock.unlock()
+      task.resume()
+    }
+    session.finishTasksAndInvalidate()
+    return result
+  }
+
+  /// 跟随重定向并保留 Range（对标 request 的默认重定向链）。
+  func urlSession(_ session: URLSession, task: URLSessionTask,
+                  willPerformHTTPRedirection response: HTTPURLResponse,
+                  newRequest request: URLRequest,
+                  completionHandler: @escaping (URLRequest?) -> Void) {
+    var redirected = request
+    redirected.httpMethod = "GET"
+    redirected.setValue("bytes=0-1", forHTTPHeaderField: "Range")
+    completionHandler(redirected)
+  }
+
+  func urlSession(_ session: URLSession, dataTask: URLSessionDataTask,
+                  didReceive response: URLResponse,
+                  completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+    let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+    guard (200..<300).contains(code) else {
+      completionHandler(.cancel)
+      resolve(url: nil, code: code, error: nil)
+      return
+    }
+    // 最终响应 URL = resp.history 末项；响应头到手即取消，避免下载完整 body
+    completionHandler(.cancel)
+    resolve(url: response.url?.absoluteString, code: code, error: nil)
+  }
+
+  func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+    // 若已由 didReceive response resolve，则 continuation 已清空，此处为 no-op
+    resolve(url: nil, code: nil, error: error)
+  }
+
+  private func resolve(url: String?, code: Int?, error: Error?) {
+    lock.lock()
+    guard let cont = continuation else { lock.unlock(); return }
+    continuation = nil
+    lock.unlock()
+    if let error {
+      cont.resume(throwing: error)
+    } else if let url, let code, (200..<300).contains(code) {
+      cont.resume(returning: url)
+    } else {
+      cont.resume(throwing: NSError(domain: "LX", code: -5,
+                                    userInfo: [NSLocalizedDescriptionKey: "verifyUrl 失败（HTTP \(code ?? -1)）"]))
+    }
+  }
+}

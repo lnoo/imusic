@@ -6,6 +6,17 @@ import Foundation
 /// 音乐平台源，对标 LX.Source
 enum MusicSource: String, CaseIterable, Codable, Hashable, Sendable {
   case kw, kg, tx, wy, mg, local
+  /// GD音乐台扩展提供的额外平台（extensions/gdstudio/src/identity.ts）
+  case gdNetease = "gd-netease"
+  case gdKuwo = "gd-kuwo"
+  case gdTencent = "gd-tencent"
+  case gdJoox = "gd-joox"
+  case gdTidal = "gd-tidal"
+  case gdQobuz = "gd-qobuz"
+  case gdBilibili = "gd-bilibili"
+  case gdApple = "gd-apple"
+  case gdYtmusic = "gd-ytmusic"
+  case gdSpotify = "gd-spotify"
   /// 显示名唯一来源：SourceRegistry（加新源只改注册处）
   var displayName: String {
     let name = SourceRegistry.capability(id: rawValue)?.displayName ?? rawValue
@@ -16,12 +27,18 @@ enum MusicSource: String, CaseIterable, Codable, Hashable, Sendable {
 /// 音质，对标 LX.Quality
 enum MusicQuality: String, CaseIterable, Codable, Hashable, Sendable {
   case q128k = "128k"
+  case q192k = "192k"
   case q320k = "320k"
   case flac
   case flac24bit
+  case wav
+  case dolby
+  case master
 
-  /// 高->低，用于降级选择（对标 getPlayQuality）
-  static var highToLow: [MusicQuality] { [.flac24bit, .flac, .q320k, .q128k] }
+  /// 高->低，用于降级选择（对齐 lx-api-source-loader isolate/index.ts 的降级链）
+  static var highToLow: [MusicQuality] {
+    [.master, .dolby, .flac24bit, .flac, .wav, .q320k, .q192k, .q128k]
+  }
 }
 
 enum UserApiAction: String, Codable, Hashable, Sendable {
@@ -46,6 +63,9 @@ struct UserApiInfo: Codable, Identifiable, Hashable, Sendable {
   var version: String
   var allowShowUpdateAlert: Bool
   var sources: [String: UserApiSourceInfo]? // key = MusicSource.rawValue（Codable 兼容）
+  /// 清单来源标识（nil = 直接 JS 导入），用于 UI 标记与按清单去重
+  var manifestURL: String? = nil
+  var sourceId: String? = nil
 }
 
 /// 含 script 的完整版，对标 LX.UserApi.UserApiInfoFull
@@ -60,6 +80,25 @@ struct UserApiInfoFull: Codable, Sendable {
   var version: String
   var allowShowUpdateAlert: Bool
   var script: String
+  /// 来源清单地址/标识；nil 表示直接导入的 JS 脚本
+  var manifestURL: String? = nil
+  /// 清单中的稳定 id，用于按清单去重与后续更新
+  var sourceId: String? = nil
+}
+
+// MARK: - 音源清单（JSON）
+// 对标 shellsec/lx-music-source 的 sources.json：
+// { "sources": [ { "id", "name", "url" } ] }
+// 清单只提供索引，JS 仍需按 url 下载后走原有导入管线（头部解析 + 压缩 + 沙箱初始化）
+
+struct ManifestSource: Codable, Hashable, Identifiable, Sendable {
+  var id: String
+  var name: String
+  var url: String
+}
+
+struct SourceManifest: Codable, Sendable {
+  var sources: [ManifestSource]
 }
 
 // MARK: - Music
@@ -70,7 +109,14 @@ struct MusicQualityType: Codable, Hashable, Sendable {
 }
 
 struct MusicInfo: Identifiable, Hashable, Codable, Sendable {
-  var id: String { "\(source.rawValue)_\(songmid)" }
+  /// 10 个 gd-* 源走 GD v1 身份（identity.ts buildMusicId），其余源保持旧格式
+  var id: String {
+    let raw = source.rawValue
+    if ALGdResourceIds.toGdSource(raw) != nil {
+      return ALGdResourceIds.buildHostId(source: ALGdResourceIds.toGdSource(raw) ?? raw, rawId: songmid)
+    }
+    return "\(raw)_\(songmid)"
+  }
   var name: String
   var singer: String
   var source: MusicSource
@@ -91,6 +137,8 @@ struct LyricInfo: Codable, Hashable, Sendable {
   var tlyric: String?
   var rlyric: String?
   var lxlyric: String?
+  /// 扩展返回的逐字歌词（online-metadata musicLyric 的 awlyric）
+  var awlyric: String? = nil
 }
 
 struct UpdateAlert: Hashable, Sendable {

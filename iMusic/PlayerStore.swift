@@ -99,10 +99,18 @@ final class PlayerStore {
     guard let engine, engine.inited,
           engine.sources[song.source.rawValue]?.actions.contains(.musicUrl) == true else { return nil }
     let q = pickQuality(for: song, supported: engine.qualitys[song.source.rawValue])
-    if let v = try? await engine.callScript(source: song.source.rawValue, action: .musicUrl, quality: q, music: song),
-       let u = v as? String { return u }
+    if let u = try? await resolveFromScripts(song, quality: q) { return u }
     if let alt = await findOtherSource(song, quality: q) { return alt.url }
     return nil
+  }
+
+  /// 统一走引擎的多脚本调度：按优先级选源 + 音质降级 + 失败脚本排除重试
+  /// （对齐 isolate/index.ts getMusicUrl；调用方仍保留换源/内置兜底）。
+  private func resolveFromScripts(_ song: MusicInfo, quality: MusicQuality) async throws -> String? {
+    guard let engine, engine.inited else { return nil }
+    let value = try await engine.callScript(source: song.source.rawValue, action: .musicUrl,
+                                            quality: quality, music: song)
+    return value as? String
   }
 
   private var player = AVPlayer()
@@ -556,17 +564,17 @@ final class PlayerStore {
       let q = pickQuality(for: song, supported: sup)
       var urlStr: String?
       var played: MusicInfo = song
-      // 1) 若自定义源已初始化且声明了该 source+musicUrl，则走 JS 沙箱（复刻 useInitUserApi 动态注入逻辑）
+      // 1) 自定义源优先：统一交给引擎多脚本调度（音质降级 + 失败脚本 exclude 递归），
+      //    不再只对单个 JSContext 试一次。
       if let engine, engine.inited,
          engine.sources[song.source.rawValue]?.actions.contains(.musicUrl) == true {
         do {
-          let value = try await engine.callScript(source: song.source.rawValue, action: .musicUrl, quality: q, music: song)
+          urlStr = try await resolveFromScripts(song, quality: q)
           guard token == playToken else { return }
-          urlStr = value as? String
-          status = "自定义源解析中"
+          if urlStr != nil { status = "自定义源解析中" }
         } catch {
           guard token == playToken else { return }
-          // 2) 换源播放（对标 core/music findMusic）：同曲去其他源找
+          // 2) 换源播放（对标 core/music findMusic）：引擎全部候选失败后的次级兜底
           status = "本源失败，正在换源…"
           if let alternative = await findOtherSource(song, quality: q) {
             guard token == playToken else { return }
@@ -578,16 +586,24 @@ final class PlayerStore {
       }
       // 2) MVP兜底：注册表 fallbackUrl（对标 any-listen musicUrl；kw www playUrl 签名直链 /
       //    wy·tx 走 GD音乐台同源接口；无自定义源或脚本失败时兜底可播）
+      /// GD音乐台扩展 updatePlayingMusicQuality：把实际解析出的档位回写播放项
+      var gdActualQuality: MusicQuality?
       if urlStr == nil, song.source != .local {
         if let info = await SourceRegistry.capability(id: song.source.rawValue)?.fallbackUrl?(song, q) {
           urlStr = info.url
           status = "内置兜底解析中"
+          if ALGdResourceIds.toGdSource(song.source.rawValue) != nil {
+            gdActualQuality = info.quality
+          }
         }
       }
       guard token == playToken else { return }
       guard let s = urlStr, let url = URL(string: s) else { throw NSError(domain: "LX", code: -1, userInfo: [NSLocalizedDescriptionKey: "无可用播放链接"]) }
       resolvedUrl = s
-      if played.id != song.id {
+      if let actual = gdActualQuality {
+        played.qualitys = ALQualityBridge.qualitys(fromBr: ALQualityBridge.toBr(actual))
+      }
+      if played.id != song.id || gdActualQuality != nil {
         current = played
         if let i = queue.firstIndex(where: { $0.id == song.id }) { queue[i] = played }
       }

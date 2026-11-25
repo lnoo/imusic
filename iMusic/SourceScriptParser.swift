@@ -72,7 +72,7 @@ struct SourceScriptParser {
   }
 
   static func inflateFromStorage(_ stored: String) throws -> String {
-    guard stored.hasPrefix("gz_") else { return stored } // 兼容明文老数据
+    guard stored.hasPrefix("gz_") else { throw SourceScriptError.invalidFile }
     guard let data = Data(base64Encoded: String(stored.dropFirst(3))) else {
       throw SourceScriptError.invalidFile
     }

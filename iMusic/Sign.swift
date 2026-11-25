@@ -3,9 +3,11 @@ import CryptoKit
 import CommonCrypto
 
 // MARK: - 签名与格式化小工具
-// 对标：renderer/utils/index.ts(sizeFormate/formatPlayTime/decodeName)
-//      wy/utils/crypto.js(eapi) / mg/musicSearch.js(createSignature)
-//      （tx zzcSign 签名随 DoSearchForQQMusicDesktop 端点失效一并下线，改走免签名的 DoSearchForQQMusicMobile）
+// 对标：extensions/online-metadata
+//      src/shared/common.ts(sizeFormate/formatPlayTime) + shared/utils.ts(decodeName)
+//      wy/utils/crypto.ts(eapi) / mg/utils/index.ts(createSignature)
+//      tx/utils/crypto.ts(zzcSign)：iMusic 当前搜索走免签名的 DoSearchForQQMusicMobile，
+//      签名实现保留供后续对齐 musics.fcg 时使用。
 
 enum iMusicSign {
   static func md5(_ s: String) -> String {
@@ -50,7 +52,7 @@ enum iMusicSign {
     arr.compactMap { $0["name"] as? String }.joined(separator: "、")
   }
 
-  // MARK: - wy eapi（对标 wy/utils/crypto.js eapi；搜索/歌词只用 eapi，无需 RSA）
+  // MARK: - wy eapi（对齐 extensions/online-metadata/src/onlineResource/wy/utils/crypto.ts；搜索/歌词只用 eapi）
   static func wyEapiParams(url: String, object: [String: Any]) throws -> String {
     let text = String(data: try JSONSerialization.data(withJSONObject: object), encoding: .utf8) ?? "{}"
     let message = "nobody\(url)use\(text)md5forencrypt"

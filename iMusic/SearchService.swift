@@ -30,6 +30,13 @@ final class SearchService {
   private var hotWordsFetched = false
   var suggestions: [String] = []
   var showSuggestions = false
+  /// 热词/联想的来源（对齐 online-metadata 各源 hotSearch/tipSearch；默认 mg）
+  var suggestSource: MusicSource = .mg {
+    didSet {
+      hotWordsFetched = false
+      hotWords = Self.hotKeywords
+    }
+  }
   private var suggestTask: Task<Void, Never>?
   private var suggestSession = 0
 
@@ -39,7 +46,7 @@ final class SearchService {
     hotWordsLoading = true
     defer { hotWordsLoading = false }
     hotWordsFetched = true
-    let words = await AnyListenResource.hotSearch(source: .mg)
+    let words = await AnyListenResource.hotSearch(source: suggestSource)
     if !words.isEmpty { hotWords = words }
   }
 
@@ -57,7 +64,7 @@ final class SearchService {
     suggestTask = Task { [weak self] in
       try? await Task.sleep(for: .milliseconds(250))
       guard !Task.isCancelled, let self else { return }
-      let words = await AnyListenResource.tipSearch(source: .mg, keyword: kw)
+      let words = await AnyListenResource.tipSearch(source: suggestSource, keyword: kw)
       guard session == self.suggestSession, !Task.isCancelled else { return }
       self.suggestions = words
       self.showSuggestions = !words.isEmpty
@@ -168,11 +175,6 @@ final class SearchService {
     return d.appendingPathComponent("home_charts_v2.json")
   }
 
-  /// 旧缓存文件（v1：key = 源id）。仅做一次性迁移。
-  private var legacyChartsCacheFile: URL {
-    chartsCacheFile.deletingLastPathComponent().appendingPathComponent("home_charts.json")
-  }
-
   // MARK: 榜单动态目录（any-listen topSongs 接口；带榜图；kg/tx 有数十张榜）
   /// sourceId -> 动态目录；空/失败时 `boards(for:)` 回退 HomeBoards 静态目录
   var boardCatalog: [String: [HomeBoard]] = [:]
@@ -220,22 +222,6 @@ final class SearchService {
       if !merged.isEmpty {
         self.homeCharts = merged
         self.homeChartsUpdatedAt = c.updatedAt
-        return Date().timeIntervalSince(c.updatedAt) < Self.homeChartsTTL
-      }
-    }
-    // v1 一次性迁移：老 key 是源 id，映射到该源首榜；新榜切源时再拉
-    if let data = try? Data(contentsOf: legacyChartsCacheFile),
-       let c = try? JSONDecoder().decode(HomeChartsCache.self, from: data) {
-      var mapped: [String: [MusicInfo]] = [:]
-      for (srcId, items) in c.charts where !items.isEmpty {
-        if let def = HomeBoards.boards(for: srcId).first {
-          mapped[def.id] = items
-        }
-      }
-      if !mapped.isEmpty {
-        self.homeCharts = mapped
-        self.homeChartsUpdatedAt = c.updatedAt
-        saveHomeChartsCache()
         return Date().timeIntervalSince(c.updatedAt) < Self.homeChartsTTL
       }
     }

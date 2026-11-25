@@ -71,7 +71,7 @@ enum LXListTransform {
   /// default/love 这两个"默认列表"结构（TS 里的 defaultList/loveList 常量 + 填充）
   private static func buildDefaultLikeList(id: String, name: String, list: [[String: Any]],
                                            time: Double, addListType: AddListType) -> [String: Any] {
-    var meta = metaBase()
+    var meta = metaBase(updateTime: 0)
     let count = list.count
     let songs = list.enumerated().compactMap { i, m -> [String: Any]? in
       buildMusicInfo(fixQuality(m), addListType: addListType, time: time, count: count, idx: i)
@@ -92,7 +92,7 @@ enum LXListTransform {
     if let sourceListId = list["sourceListId"] as? String {
       let source = ALHttp.str(list["source"])
       let isBoard = sourceListId.hasPrefix("board__")
-      var meta = metaBase()
+      var meta = metaBase(updateTime: time)
       meta["extensionId"] = "online-metadata"
       meta["source"] = source
       meta["sourceType"] = isBoard ? "topSongs" : "songlist"
@@ -105,7 +105,7 @@ enum LXListTransform {
               "type": "online", "parentId": NSNull(), "meta": meta, "list": songs]
     }
 
-    var meta = metaBase()
+    var meta = metaBase(updateTime: time)
     meta["songCount"] = songs.count
     return ["id": genId(), "name": list["name"] as? String ?? "",
             "type": "general", "parentId": NSNull(), "meta": meta, "list": songs]
@@ -113,9 +113,9 @@ enum LXListTransform {
 
   // MARK: 歌曲构建
 
-  private static func metaBase() -> [String: Any] {
-    let now = Int(Date().timeIntervalSince1970 * 1000)
-    return ["playCount": 0, "createTime": now, "updateTime": 0, "posTime": 0,
+  private static func metaBase(updateTime: Double) -> [String: Any] {
+    let now = Date().timeIntervalSince1970 * 1000
+    return ["playCount": 0, "createTime": now, "updateTime": updateTime, "posTime": 0,
             "songCount": 0, "pic": "", "desc": ""]
   }
 
@@ -131,7 +131,7 @@ enum LXListTransform {
       let isLocalMeta: [String: Any] = [
         "albumName": lxMeta["albumName"] as? String ?? "",
         "musicId": lxID,
-        "createTime": Int(createTime), "posTime": Int(createTime), "updateTime": Int(createTime),
+        "createTime": createTime, "posTime": createTime, "updateTime": createTime,
         "sizeStr": "", "picUrl": lxMeta["picUrl"] as? String ?? "",
         "bitrateLabel": "", "deviceId": "", "ext": lxMeta["ext"] as? String ?? "",
         "filePath": lxMeta["filePath"] as? String ?? "",
@@ -149,11 +149,11 @@ enum LXListTransform {
     var meta: [String: Any] = data
     meta["source"] = source
     // TS: String(meta.id || meta.songId)；后续按 songId/id 再覆盖
-    meta["musicId"] = String(ALHttp.int(lxMeta["id"]) ?? ALHttp.int(lxMeta["songId"]) ?? 0)
+    meta["musicId"] = jsString(truthy(lxMeta["id"]) ? lxMeta["id"] : lxMeta["songId"])
     meta["qualitys"] = buildQualitys(_qualitys)
-    meta["createTime"] = Int(createTime)
-    meta["posTime"] = Int(createTime)
-    meta["updateTime"] = Int(createTime)
+    meta["createTime"] = createTime
+    meta["posTime"] = createTime
+    meta["updateTime"] = createTime
 
     var info: [String: Any] = [
       "id": lxID, "name": lx["name"] ?? "", "singer": lx["singer"] ?? "",
@@ -163,13 +163,41 @@ enum LXListTransform {
     if source == "kg" {
       info["id"] = "kg_\(lxID)"
     }
-    if let songId = lxMeta["songId"] {
-      info["meta"] = merged(meta, ["musicId": String(ALHttp.int(songId) ?? ALHttp.int(lxMeta["id"]) ?? 0)])
+    if truthy(lxMeta["songId"]) {
+      info["meta"] = merged(meta, ["musicId": jsString(lxMeta["songId"])])
     }
-    if let id = lxMeta["id"] {
-      info["meta"] = merged(info["meta"] as? [String: Any] ?? [:], ["songId": String(ALHttp.int(id) ?? 0)])
+    if truthy(lxMeta["id"]) {
+      info["meta"] = merged(info["meta"] as? [String: Any] ?? [:], ["songId": jsString(lxMeta["id"])])
     }
     return info
+  }
+
+  /// JSONSerialization 把布尔也桥接成 NSNumber；用 CF 类型 ID 区分它与普通数字。
+  private static func isJSBool(_ n: NSNumber) -> Bool {
+    CFGetTypeID(n) == CFBooleanGetTypeID()
+  }
+
+  /// JS 真值判断：`undefined` / `null` / `""` / `0` / `false` 为假，其余为真。
+  private static func truthy(_ v: Any?) -> Bool {
+    guard let v else { return false }
+    if v is NSNull { return false }
+    if let s = v as? String { return !s.isEmpty }
+    if let n = v as? NSNumber { return isJSBool(n) ? n.boolValue : n.doubleValue != 0 }
+    return true
+  }
+
+  /// JS `String(value)`：undefined → "undefined"，null → "null"，数字保持数字字面量。
+  private static func jsString(_ v: Any?) -> String {
+    guard let v else { return "undefined" }
+    if v is NSNull { return "null" }
+    if let s = v as? String { return s }
+    if let n = v as? NSNumber {
+      if isJSBool(n) { return n.boolValue ? "true" : "false" }
+      let d = n.doubleValue
+      if d == d.rounded(), abs(d) < 1e15 { return String(Int(d)) }
+      return n.stringValue
+    }
+    return "\(v)"
   }
 
   private static func merged(_ a: [String: Any], _ b: [String: Any]) -> [String: Any] {
@@ -183,7 +211,8 @@ enum LXListTransform {
       guard var o = v as? [String: Any] else { continue }
       let size = o["size"]
       o.removeValue(forKey: "size")
-      o["sizeStr"] = size
+      // TS 解构 `{ size, ...arg }` 后总是写 `sizeStr: size`；size 缺失时保留该键（NSNull 对应 undefined）。
+      o["sizeStr"] = size ?? NSNull()
       out[k] = o
     }
     return out
@@ -225,8 +254,23 @@ enum LXListTransform {
     return out
   }
 
+  /// TS: `Date.now().toString(36) + Math.random().toString(36).slice(2)`
+  /// 即 base36 时间戳 + base36 随机小数部分（去掉 "0."）。
   private static func genId() -> String {
-    String(Int(Date().timeIntervalSince1970 * 1000), radix: 36) + String(Int.random(in: 0..<1_000_000), radix: 36)
+    let timestamp = String(Int(Date().timeIntervalSince1970 * 1000), radix: 36)
+    let digits = Array("0123456789abcdefghijklmnopqrstuvwxyz")
+    // Math.random() 提供 53 位随机性；用定点整数展开求其 36 进制小数，避免浮点误差。
+    var numerator = UInt64.random(in: 0..<(1 << 53))
+    let denominator: UInt64 = 1 << 53
+    var fraction = ""
+    for _ in 0..<12 {
+      numerator *= 36
+      let d = numerator / denominator
+      fraction.append(digits[Int(d)])
+      numerator %= denominator
+      if numerator == 0 { break }
+    }
+    return timestamp + fraction
   }
 
   enum LXListError: LocalizedError {

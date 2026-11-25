@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 
 // MARK: - 顶部菜单栏（MenuBarExtra）
 // 图标态：无曲目=音符；播放中=播放符+暂停点；已暂停=播放符
@@ -255,6 +256,11 @@ struct MenuBarView: View {
 
       Spacer()
 
+      Button("导入 LX 歌单备份") { importLXBackup() }
+        .buttonStyle(.borderless)
+        .font(.system(size: 11))
+        .help("导入 LX Music 导出的歌单备份（.lxmc / .json），转换为 iMusic 歌单数据")
+
       Button("主界面") {
         openMainWindow()
       }
@@ -270,6 +276,45 @@ struct MenuBarView: View {
       .buttonStyle(.borderless)
       .help("退出 iMusic")
       .accessibilityLabel("退出 iMusic")
+    }
+  }
+
+  /// 对标 extensions/lx-list-transform：选择 .lxmc/.json → 解压/解析 → 转换为 any-listen 备份
+  private func importLXBackup() {
+    let panel = NSOpenPanel()
+    panel.title = "导入 LX 歌单备份"
+    panel.canChooseFiles = true
+    panel.canChooseDirectories = false
+    panel.allowsMultipleSelection = false
+    panel.allowedContentTypes = [.json, UTType(filenameExtension: "lxmc")].compactMap { $0 }
+    guard panel.runModal() == .OK, let url = panel.url else { return }
+    do {
+      let data = try Data(contentsOf: url)
+      let text: String
+      if url.pathExtension.lowercased() == "lxmc" {
+        let inflated = try SourceScriptParser.decompress(data)
+        text = String(data: inflated, encoding: .utf8) ?? ""
+      } else {
+        text = String(data: data, encoding: .utf8) ?? ""
+      }
+      guard !text.isEmpty, let obj = try JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any] else {
+        throw NSError(domain: "LXListTransform", code: -1,
+                      userInfo: [NSLocalizedDescriptionKey: "备份文件内容不是有效 JSON"])
+      }
+      let type = (obj["type"] as? String).flatMap { ["playList_v2", "playListPart_v2", "allData_v2"].contains($0) ? $0 : nil }
+        ?? (obj["playList"] != nil ? "allData_v2" : "playListPart_v2")
+      let json = try LXListTransform.transform(type: type, data: obj)
+      let save = NSSavePanel()
+      save.title = "保存 iMusic 歌单备份"
+      save.nameFieldStringValue = "imusic-list-import.json"
+      save.allowedContentTypes = [.json]
+      guard save.runModal() == .OK, let dest = save.url else { return }
+      try Data(json.utf8).write(to: dest)
+    } catch {
+      let alert = NSAlert()
+      alert.messageText = "LX 歌单导入失败"
+      alert.informativeText = error.localizedDescription
+      alert.runModal()
     }
   }
 

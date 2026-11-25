@@ -82,7 +82,8 @@ final class AppState {
       do {
         let info = try await AnyListenResource.musicLyric(source: source, music: song)
         return ["ok": true, "lyric": info.lyric, "tlyric": info.tlyric ?? "",
-                "rlyric": info.rlyric ?? "", "lxlyric": info.lxlyric ?? ""].jsonEncoded
+                "rlyric": info.rlyric ?? "", "lxlyric": info.lxlyric ?? "",
+                "awlyric": info.awlyric ?? ""].jsonEncoded
       } catch {
         return fail(error.localizedDescription)
       }
@@ -169,35 +170,50 @@ final class AppState {
     player.qualityMap = engine.inited ? engine.qualitys : SourceRegistry.builtinQualityMap
   }
 
-  /// 切换/重载自定义源（复刻 setUserApi：user_api_* 走沙箱，其余走内置）
-  /// reloadSeq：并发 reload 时只让最后一次写状态，避免旧任务覆盖新结果
+  /// 切换/重载自定义源（对标 lx-api-source-loader src/main/index.ts:9-81）
+  /// 按 api.enabledSourceIds 顺序加载全部启用脚本；reloadSeq 保证并发时只认最后一次。
   private var reloadSeq = 0
 
   func reloadSource() async {
     reloadSeq += 1
     let seq = reloadSeq
-    let id = api.activeSourceId
-    if id.hasPrefix("user_api_") {
-      do {
-        let raw = try api.rawScript(id: id)
-        let meta = try SourceScriptParser.parseMeta(raw)
-        guard seq == reloadSeq else { return }
-        api.statusMessage = "正在加载源「\(meta.name)」…"
-        try await engine.load(scriptRaw: raw, meta: meta)
-        guard seq == reloadSeq else { return }
-        api.updateInitedSources(id: id, sources: engine.sources)
-        api.statusMessage = engine.message
-        syncQualityMap()
-      } catch {
-        guard seq == reloadSeq else { return }
-        api.statusMessage = "源加载失败：\(error.localizedDescription)"
-      }
-    } else {
+    let ids = api.enabledSourceIds.filter { $0.hasPrefix("user_api_") }
+    guard !ids.isEmpty else {
       engine.unload()
       guard seq == reloadSeq else { return }
-      api.statusMessage = "当前为内置模式（无自定义源，仅搜索+兜底试听）"
+      api.statusMessage = "当前为内置模式（无启用自定义源，仅搜索+兜底试听）"
       syncQualityMap()
+      return
     }
+
+    var specs: [UserApiEngine.ScriptSpec] = []
+    var failedNames: [String] = []
+    for id in ids {
+      do {
+        let raw = try api.rawScript(id: id)
+        specs.append(UserApiEngine.ScriptSpec(id: id, scriptRaw: raw, meta: try SourceScriptParser.parseMeta(raw)))
+      } catch {
+        failedNames.append(error.localizedDescription)
+      }
+      guard seq == reloadSeq else { return }
+    }
+
+    if specs.isEmpty {
+      engine.unload()
+      guard seq == reloadSeq else { return }
+      api.statusMessage = "源加载失败：\(failedNames.prefix(2).joined(separator: "；"))"
+      syncQualityMap()
+      return
+    }
+
+    api.statusMessage = "正在加载 \(specs.count) 个源…"
+    await engine.loadAll(specs)
+    guard seq == reloadSeq else { return }
+    for spec in specs {
+      api.updateInitedSources(id: spec.id, sources: engine.sources(forScript: spec.id))
+    }
+    api.statusMessage = engine.message
+    syncQualityMap()
   }
 }
 
@@ -206,8 +222,6 @@ struct iMusicApp: App {
   @State private var state: AppState
 
   init() {
-    // 必须在 AppState（及各 Store 单例）首次触盘前执行：老名字残留数据一次性搬家
-    DataMigration.run()
     _state = State(wrappedValue: AppState())
   }
 
