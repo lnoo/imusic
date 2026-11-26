@@ -87,7 +87,6 @@ struct UserApiInfoFull: Codable, Sendable {
 }
 
 // MARK: - 音源清单（JSON）
-// 对标 shellsec/lx-music-source 的 sources.json：
 // { "sources": [ { "id", "name", "url" } ] }
 // 清单只提供索引，JS 仍需按 url 下载后走原有导入管线（头部解析 + 压缩 + 沙箱初始化）
 

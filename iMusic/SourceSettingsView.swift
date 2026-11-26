@@ -34,8 +34,6 @@ struct SourceSettingsView: View {
   @State private var useOrgSource = ALGdSign.useOrgSource
   @State private var preloadQualityOnSearch = ALGdSign.preloadQualityOnSearch
 
-  private let shellsecExample = "https://gh-proxy.org/https://raw.githubusercontent.com/shellsec/lx-music-source/master/sources.gh-proxy.json"
-
   private var trimmedURL: String { urlInput.trimmingCharacters(in: .whitespacesAndNewlines) }
 
   private var canSubmit: Bool {
@@ -327,29 +325,6 @@ struct SourceSettingsView: View {
           .foregroundStyle(.black)
           .background(Capsule().fill(canSubmit ? Theme.accent : Theme.cardHover))
           .disabled(!canSubmit)
-        }
-
-        if importMode == .json {
-          HStack(spacing: 4) {
-            Text("示例：")
-              .font(Theme.caption())
-              .foregroundStyle(Theme.text2)
-            Button("填入 shellsec 订阅地址") { urlInput = shellsecExample }
-              .buttonStyle(.plain)
-              .font(Theme.caption())
-              .foregroundStyle(Theme.accent)
-            Link("仓库说明", destination: URL(string: "https://github.com/shellsec/lx-music-source")!)
-              .font(Theme.caption())
-          }
-        } else {
-          HStack(spacing: 4) {
-            Text("脚本地址可从在线源仓库获取：")
-              .font(Theme.caption())
-              .foregroundStyle(Theme.text2)
-            Link("shellsec/lx-music-source",
-                 destination: URL(string: "https://github.com/shellsec/lx-music-source")!)
-              .font(Theme.caption())
-          }
         }
       }
 

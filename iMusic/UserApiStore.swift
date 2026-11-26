@@ -12,8 +12,7 @@ import Observation
 // 存储：~/Library/Application Support/iMusic/user_api.json
 // script 字段格式：gz_+base64(zlib)，与桌面端完全互通（可直接复制 user_api.json）
 //
-// 音源清单（JSON）对标 shellsec/lx-music-source 的 sources.json：
-// 清单只提供 {id, name, url}，按 url 下载 JS 后复用 importRawScript 管线。
+// 音源清单（JSON）只提供 {id, name, url}，按 url 下载 JS 后复用 importRawScript 管线。
 
 @Observable @MainActor
 final class UserApiStore {
